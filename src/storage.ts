@@ -1,4 +1,4 @@
-import { Redis } from 'ioredis';
+import { Redis, type RedisOptions } from 'ioredis';
 import { promisify } from 'util';
 import { gzip, gunzip } from 'zlib';
 import type {
@@ -33,27 +33,39 @@ export class ValkeyStorage implements StorageModule {
   async init(settings: NodeREDSettings): Promise<void> {
     const userConfig = settings.valkey || {};
 
-    // Default configuration
+    // Separate storage-specific options from ioredis connection options
+    const {
+      keyPrefix = 'nodered:',
+      publishOnSave = false,
+      subscribeToUpdates = false,
+      updateChannel = 'nodered:flows:updated',
+      enableCompression = false,
+      sessionTTL = 86400, // 24 hours
+      ...ioredisConfig
+    } = userConfig;
+
+    // Type-safe ioredis config
+    const ioredisOptions = ioredisConfig as RedisOptions;
+
+    // Store storage-specific config
     this.config = {
-      host: 'localhost',
-      port: 6379,
-      password: undefined,
-      db: 0,
-      keyPrefix: 'nodered:',
-      publishOnSave: false,
-      subscribeToUpdates: false,
-      updateChannel: 'nodered:flows:updated',
-      enableCompression: false,
-      sessionTTL: 86400, // 24 hours
-      ...userConfig,
+      keyPrefix,
+      publishOnSave,
+      subscribeToUpdates,
+      updateChannel,
+      enableCompression,
+      sessionTTL,
+      // Preserve ioredis config for logging and duplicate()
+      ...ioredisOptions,
     } as Required<ValkeyStorageConfig>;
 
-    // Create Redis client
+    // Pass ioredis options directly - let ioredis handle its own defaults
+    const connectionConfig: RedisOptions = ioredisOptions;
+    const hasAdvancedConfig = ioredisOptions.sentinels;
+
+    // Create Redis client with all ioredis options
     this.client = new Redis({
-      host: this.config.host,
-      port: this.config.port,
-      password: this.config.password,
-      db: this.config.db || 0,
+      ...connectionConfig,
       retryStrategy: (times: number) => {
         const delay = Math.min(times * 50, 2000);
         return delay;
@@ -69,7 +81,13 @@ export class ValkeyStorage implements StorageModule {
 
     await this.client.ping();
 
-    console.log(`[ValkeyStorage] Connected to ${this.config.host}:${this.config.port}`);
+    // Log connection info
+    const connInfo = hasAdvancedConfig
+      ? 'Redis (Sentinel mode)'
+      : connectionConfig.host
+        ? `${connectionConfig.host}:${connectionConfig.port || 6379}`
+        : 'Redis (default connection)';
+    console.log(`[ValkeyStorage] Connected to ${connInfo}`);
 
     // Setup subscriber for worker nodes
     if (this.config.subscribeToUpdates) {

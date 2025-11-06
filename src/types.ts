@@ -1,27 +1,14 @@
-export interface ValkeyStorageConfig {
-  /**
-   * Redis/Valkey host
-   * @default "localhost"
-   */
-  host?: string;
+import type { RedisOptions } from 'ioredis';
 
-  /**
-   * Redis/Valkey port
-   * @default 6379
-   */
-  port?: number;
-
-  /**
-   * Redis/Valkey password (optional)
-   */
-  password?: string;
-
-  /**
-   * Redis/Valkey database number
-   * @default 0
-   */
-  db?: number;
-
+/**
+ * Valkey Storage Configuration
+ * Extends ioredis RedisOptions to support all connection modes:
+ * - Single instance: { host, port }
+ * - Sentinel: { sentinels: [...], name: 'mymaster' }
+ * - Cluster: { cluster: [...] }
+ * - TLS: { tls: {...} }
+ */
+export interface ValkeyStorageConfig extends Partial<RedisOptions> {
   /**
    * Redis/Valkey key prefix for all storage keys
    * @default "nodered:"
