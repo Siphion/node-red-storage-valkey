@@ -1,6 +1,6 @@
 {
   "name": "node-red-storage-valkey",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Valkey/Redis storage module for Node-RED with pub/sub auto-reload support",
   "keywords": [
     "node-red",
