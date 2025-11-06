@@ -6,6 +6,7 @@ A professional Valkey/Redis storage module for Node-RED with built-in pub/sub su
 
 - ✅ **Full Storage API Implementation** - All 11 Node-RED storage methods
 - ✅ **Valkey/Redis Compatible** - Works with both Valkey and Redis
+- ✅ **Redis Sentinel Support** - High availability with automatic failover
 - ✅ **Pub/Sub Auto-Reload** - Workers automatically reload when flows change
 - ✅ **TypeScript** - Full type safety and IntelliSense support
 - ✅ **Compression** - Optional gzip compression for large flows
@@ -56,6 +57,33 @@ module.exports = {
 };
 ```
 
+### Redis Sentinel (High Availability)
+
+For production deployments with automatic failover:
+
+```javascript
+// settings.js
+module.exports = {
+  storageModule: require('node-red-storage-valkey'),
+  valkey: {
+    // Sentinel configuration
+    sentinels: [
+      { host: 'sentinel1', port: 26379 },
+      { host: 'sentinel2', port: 26379 },
+      { host: 'sentinel3', port: 26379 }
+    ],
+    name: 'mymaster', // Sentinel master group name
+    password: process.env.REDIS_PASSWORD, // Optional
+    sentinelPassword: process.env.SENTINEL_PASSWORD, // Optional
+
+    // Storage-specific options
+    keyPrefix: 'nodered:',
+    publishOnSave: true,
+    enableCompression: true
+  }
+};
+```
+
 ## How It Works
 
 ### Architecture
@@ -89,17 +117,31 @@ module.exports = {
 
 ## Configuration Options
 
+### Connection Options
+
+The module supports all [ioredis connection options](https://github.com/redis/ioredis/blob/main/API.md#new-redisport-host-options). Common options:
+
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `host` | string | `'localhost'` | Valkey/Redis host |
-| `port` | number | `6379` | Valkey/Redis port |
-| `password` | string | `undefined` | Authentication password |
-| `keyPrefix` | string | `'nodered:'` | Prefix for all keys |
-| `publishOnSave` | boolean | `false` | Enable pub/sub on admin |
-| `subscribeToUpdates` | boolean | `false` | Enable auto-reload on workers |
+| `host` | string | `'localhost'` | Redis host (single instance) |
+| `port` | number | `6379` | Redis port (single instance) |
+| `password` | string | `undefined` | Redis authentication password |
+| `db` | number | `0` | Redis database number |
+| `sentinels` | array | `undefined` | Sentinel nodes: `[{host, port}, ...]` |
+| `name` | string | `undefined` | Sentinel master group name |
+| `sentinelPassword` | string | `undefined` | Sentinel authentication password |
+| `tls` | object | `undefined` | TLS/SSL configuration |
+
+### Storage-Specific Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `keyPrefix` | string | `'nodered:'` | Prefix for all Redis keys |
+| `publishOnSave` | boolean | `false` | Publish updates (admin nodes) |
+| `subscribeToUpdates` | boolean | `false` | Subscribe to updates (worker nodes) |
 | `updateChannel` | string | `'nodered:flows:updated'` | Pub/sub channel name |
-| `enableCompression` | boolean | `false` | Gzip compression for flows |
-| `sessionTTL` | number | `86400` | Session expiry in seconds |
+| `enableCompression` | boolean | `false` | Gzip compression for large data |
+| `sessionTTL` | number | `86400` | Session expiry (seconds) |
 
 ## Storage Keys
 
@@ -200,7 +242,7 @@ npm publish
 | **Horizontal Scaling** | ❌ Requires NFS | ✅ Native |
 | **Auto-Reload** | ❌ Manual restart | ✅ Automatic |
 | **Performance** | Disk I/O | In-memory |
-| **High Availability** | ❌ Single point | ✅ Redis cluster |
+| **High Availability** | ❌ Single point | ✅ Sentinel/Cluster |
 | **Setup Complexity** | Simple | Simple |
 
 ## Troubleshooting
@@ -215,14 +257,28 @@ Check that:
 
 ### Connection errors
 
+The module automatically handles reconnections, but you can customize retry behavior:
+
 ```javascript
-// Add retry and reconnect settings
 valkey: {
   host: 'valkey',
   port: 6379,
   retryStrategy: (times) => Math.min(times * 50, 2000),
-  maxRetriesPerRequest: 3
+  maxRetriesPerRequest: 3,
+  connectTimeout: 10000
 }
+```
+
+### Sentinel failover
+
+When using Sentinel, failover is automatic. The module will:
+1. Detect master failure via Sentinel
+2. Automatically connect to new master
+3. Continue operations without manual intervention
+
+Check logs for connection status:
+```
+[ValkeyStorage] Connected to Redis (Sentinel mode)
 ```
 
 ## License
