@@ -38,7 +38,10 @@ module.exports = {
     keyPrefix: 'nodered:',
     publishOnSave: true, // Enable pub/sub notifications
     enableCompression: true, // Optional: compress large flows
-    sessionTTL: 86400 // 24 hours
+    sessionTTL: 86400, // 24 hours
+    // Package synchronization (optional)
+    syncPackages: true, // Enable package sync to workers
+    packageSyncOnAdmin: true // Publish package updates
   }
 };
 ```
@@ -49,15 +52,24 @@ module.exports = {
 // settings.js
 module.exports = {
   storageModule: require('node-red-storage-valkey'),
+  autoInstallModules: true, // Allow loading packages from node_modules
   valkey: {
     host: process.env.REDIS_HOST || 'localhost',
     port: parseInt(process.env.REDIS_PORT) || 6379,
     keyPrefix: 'nodered:',
     subscribeToUpdates: true, // Auto-restart on flow changes
-    updateChannel: 'nodered:flows:updated'
+    updateChannel: 'nodered:flows:updated',
+    // Package synchronization (optional)
+    syncPackages: true, // Enable package sync from admin
+    packageSyncOnWorker: true // Auto-install packages
   },
   // Disable editor on workers
-  httpAdminRoot: false
+  httpAdminRoot: false,
+  editorTheme: {
+    palette: {
+      editable: false // Disable palette manager on workers
+    }
+  }
 };
 ```
 
@@ -83,7 +95,11 @@ module.exports = {
     // Storage-specific options
     keyPrefix: 'nodered:',
     publishOnSave: true,
-    enableCompression: true
+    enableCompression: true,
+
+    // Package synchronization (optional - for admin nodes)
+    syncPackages: true,
+    packageSyncOnAdmin: true
   }
 };
 ```
@@ -403,6 +419,9 @@ module.exports = {
     }
   },
 
+  // Node-RED settings
+  autoInstallModules: true,
+
   // Shared configuration for both modules
   valkey: {
     host: 'localhost',
@@ -410,7 +429,11 @@ module.exports = {
     keyPrefix: 'nodered:',
     publishOnSave: true,
     subscribeToUpdates: true,
-    enableCompression: true
+    enableCompression: true,
+    // Package synchronization
+    syncPackages: true,
+    packageSyncOnAdmin: true,    // Enable on admin
+    packageSyncOnWorker: true    // Enable on workers
   }
 };
 ```
@@ -419,6 +442,7 @@ This gives you:
 - ✅ Shared flows and credentials (this module)
 - ✅ Shared context data (node-red-context-valkey)
 - ✅ Auto-reload on flow updates
+- ✅ Auto-sync packages across cluster
 - ✅ True horizontal scaling with shared state
 
 ### Docker Swarm Cluster
