@@ -1,6 +1,7 @@
 import { ValkeyStorage } from './storage.js';
+import { PackageHelper } from './package-helper.js';
 
-export { ValkeyStorage };
+export { ValkeyStorage, PackageHelper };
 export * from './types.js';
 
 // Export factory function for Node-RED

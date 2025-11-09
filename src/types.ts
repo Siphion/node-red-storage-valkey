@@ -54,6 +54,33 @@ export interface ValkeyStorageConfig extends Partial<RedisOptions> {
    * @default false
    */
   supportFileSystemProjects?: boolean;
+
+  /**
+   * Enable package synchronization from Admin to Worker nodes
+   * When enabled, .config.json changes are stored in Redis
+   * @default false
+   */
+  syncPackages?: boolean;
+
+  /**
+   * Pub/sub channel name for package updates
+   * @default "nodered:packages:updated"
+   */
+  packageChannel?: string;
+
+  /**
+   * Publish package updates to workers (Admin nodes only)
+   * Requires syncPackages to be enabled
+   * @default false
+   */
+  packageSyncOnAdmin?: boolean;
+
+  /**
+   * Subscribe to package updates and auto-install (Worker nodes only)
+   * Requires syncPackages to be enabled
+   * @default false
+   */
+  packageSyncOnWorker?: boolean;
 }
 
 export interface NodeREDSettings {

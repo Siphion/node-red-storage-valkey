@@ -1,6 +1,6 @@
 {
   "name": "node-red-storage-valkey",
-  "version": "2.0.1",
+  "version": "3.0.0",
   "description": "Valkey/Redis storage module for Node-RED with pub/sub auto-reload support",
   "keywords": [
     "node-red",
@@ -34,8 +34,8 @@
   ],
   "scripts": {
     "build": "tsc && tsc -p tsconfig.cjs.json && npm run build:rename && npm run build:fix-imports",
-    "build:rename": "mv dist/cjs/index.js dist/index.cjs && mv dist/cjs/index.d.ts dist/index.d.cts && mv dist/cjs/storage.js dist/storage.cjs && mv dist/cjs/types.js dist/types.cjs && rm -rf dist/cjs",
-    "build:fix-imports": "node -e \"const fs = require('fs'); let content = fs.readFileSync('dist/index.cjs', 'utf8'); content = content.replace(/require\\(\\\".\\\/storage\\.js\\\"\\)/g, 'require(\\\"./storage.cjs\\\")').replace(/require\\(\\\".\\\/types\\.js\\\"\\)/g, 'require(\\\"./types.cjs\\\")'); fs.writeFileSync('dist/index.cjs', content);\"",
+    "build:rename": "mv dist/cjs/index.js dist/index.cjs && mv dist/cjs/index.d.ts dist/index.d.cts && mv dist/cjs/storage.js dist/storage.cjs && mv dist/cjs/types.js dist/types.cjs && mv dist/cjs/package-helper.js dist/package-helper.cjs && rm -rf dist/cjs",
+    "build:fix-imports": "node -e \"const fs = require('fs'); ['dist/index.cjs', 'dist/storage.cjs'].forEach(file => { let content = fs.readFileSync(file, 'utf8'); content = content.replace(/require\\(\\\".\\\/storage\\.js\\\"\\)/g, 'require(\\\"./storage.cjs\\\")').replace(/require\\(\\\".\\\/types\\.js\\\"\\)/g, 'require(\\\"./types.cjs\\\")').replace(/require\\(\\\".\\\/package-helper\\.js\\\"\\)/g, 'require(\\\"./package-helper.cjs\\\")'); fs.writeFileSync(file, content); });\"",
     "test": "echo \"No tests yet\"",
     "test:watch": "npm test -- --watch",
     "lint": "eslint src --ext .ts",

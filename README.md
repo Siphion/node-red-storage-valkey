@@ -10,6 +10,7 @@ A professional Valkey/Redis storage module for Node-RED with built-in pub/sub su
 - ✅ **Valkey/Redis Compatible** - Works with both Valkey and Redis
 - ✅ **Redis Sentinel Support** - High availability with automatic failover
 - ✅ **Pub/Sub Auto-Reload** - Workers automatically reload when flows change
+- ✅ **Package Synchronization** - Auto-sync Node-RED plugins from Admin to Workers
 - ✅ **Projects Support** - Optional file system sync for Node-RED projects and Git integration
 - ✅ **TypeScript** - Full type safety and IntelliSense support
 - ✅ **Compression** - Optional gzip compression for large flows
@@ -146,6 +147,10 @@ The module supports all [ioredis connection options](https://github.com/redis/io
 | `enableCompression` | boolean | `false` | Gzip compression for large data |
 | `sessionTTL` | number | `86400` | Session expiry (seconds) |
 | `supportFileSystemProjects` | boolean | `false` | Enable file system sync for Node-RED projects |
+| `syncPackages` | boolean | `false` | Enable package synchronization feature |
+| `packageChannel` | string | `'nodered:packages:updated'` | Pub/sub channel for package updates |
+| `packageSyncOnAdmin` | boolean | `false` | Publish package updates (admin nodes) |
+| `packageSyncOnWorker` | boolean | `false` | Subscribe and auto-install (worker nodes) |
 
 ## Storage Keys
 
@@ -156,6 +161,7 @@ All data is stored with the configured `keyPrefix`:
 - `nodered:settings` - User settings
 - `nodered:sessions` - User sessions (with TTL)
 - `nodered:library:<type>:<path>` - Library entries
+- `nodered:config` - Node-RED package configuration (when `syncPackages` enabled)
 
 ## Node-RED Projects Support
 
@@ -229,6 +235,154 @@ When `supportFileSystemProjects` is enabled:
 - **Worker nodes** - Should NOT enable `supportFileSystemProjects` (Redis-only)
 - **userDir required** - Node-RED must have a valid `userDir` configured
 - **File format** - Flows saved as `{rev: "...", flows: [...]}` for projects compatibility
+
+## Package Synchronization
+
+### Automatic Plugin Sync Across Cluster
+
+Enable automatic synchronization of Node-RED plugins (palette nodes) from Admin to Worker nodes. When you install a package via the Palette Manager on the Admin node, it automatically installs on all Worker nodes.
+
+```javascript
+// Admin node configuration
+module.exports = {
+  storageModule: require('node-red-storage-valkey'),
+  valkey: {
+    host: 'localhost',
+    port: 6379,
+    keyPrefix: 'nodered:',
+    publishOnSave: true,
+    // Enable package sync
+    syncPackages: true,
+    packageSyncOnAdmin: true,
+    packageChannel: 'nodered:packages:updated'
+  }
+};
+```
+
+```javascript
+// Worker node configuration
+module.exports = {
+  storageModule: require('node-red-storage-valkey'),
+  autoInstallModules: true,  // Node-RED setting
+  valkey: {
+    host: 'localhost',
+    port: 6379,
+    keyPrefix: 'nodered:',
+    subscribeToUpdates: true,
+    // Enable package sync
+    syncPackages: true,
+    packageSyncOnWorker: true,
+    packageChannel: 'nodered:packages:updated'
+  },
+  editorTheme: {
+    palette: {
+      editable: false  // Disable palette on workers
+    }
+  }
+};
+```
+
+### How It Works
+
+1. **Admin installs package** → Install via Palette Manager
+2. **Save to Redis** → `.config.json` stored in `nodered:config`
+3. **Publish event** → `PUBLISH nodered:packages:updated [package-list]`
+4. **Workers receive event** → Subscribe to package channel
+5. **Auto-install** → Workers run `npm install <packages>`
+6. **Auto-restart** → Workers exit (Docker restarts them)
+7. **Load with new packages** → Workers start with new nodes available
+
+### Package Sync Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `syncPackages` | boolean | `false` | Enable package synchronization feature |
+| `packageChannel` | string | `'nodered:packages:updated'` | Pub/sub channel for package updates |
+| `packageSyncOnAdmin` | boolean | `false` | Publish package updates (Admin only) |
+| `packageSyncOnWorker` | boolean | `false` | Subscribe and auto-install (Workers only) |
+
+### Storage Keys
+
+When package sync is enabled:
+
+- `nodered:config` - Node-RED `.config.json` (installed packages metadata)
+
+### Architecture
+
+```
+┌─────────────┐
+│   Admin     │ ── Install Package via Palette Manager
+│  (Editor)   │
+└─────────────┘
+       │
+       │ 1. Save .config.json
+       ▼
+  ┌──────────┐
+  │  Valkey  │ ── Store package list: nodered:config
+  │  /Redis  │
+  └──────────┘
+       │
+       │ 2. PUBLISH nodered:packages:updated
+       │
+       ├───────────────┬───────────────┐
+       ▼               ▼               ▼
+  ┌─────────┐    ┌─────────┐    ┌─────────┐
+  │Worker 1 │    │Worker 2 │    │Worker 3 │
+  │npm inst │    │npm inst │    │npm inst │
+  │restart  │    │restart  │    │restart  │
+  └─────────┘    └─────────────┘    └─────────┘
+```
+
+### Important Notes
+
+- **Fail-fast behavior** - Workers crash if package installation fails (ensures consistency)
+- **Admin only installs** - Only Admin node should have palette editor enabled
+- **Worker auto-install** - Workers automatically install packages without user intervention
+- **userDir required** - Workers need write access to `node_modules` directory
+- **Docker/K8s ready** - Designed for container orchestration with automatic restarts
+- **Core nodes filtered** - Only user-installed packages sync (not built-in `node-red/*` modules)
+
+### Requirements
+
+- Node-RED `userDir` must be configured
+- Workers must have write access to `userDir/node_modules`
+- npm must be available in PATH
+- Container orchestration with restart policy (Docker, Kubernetes, etc.)
+
+### Troubleshooting
+
+#### Workers don't install packages
+
+Check that:
+- `syncPackages: true` on both Admin and Workers
+- `packageSyncOnAdmin: true` on Admin
+- `packageSyncOnWorker: true` on Workers
+- Same `packageChannel` on both
+- Workers have write access to `userDir`
+- npm is available: run `which npm` or `npm --version`
+
+#### Package install fails
+
+Workers will crash (exit code 1) if package installation fails. Check logs:
+
+```bash
+# Docker
+docker logs <worker-container>
+
+# View npm errors
+[ValkeyStorage] npm: ERR! <error details>
+```
+
+Common causes:
+- Network issues (npm registry unreachable)
+- Invalid package name
+- Package version conflicts
+- Insufficient disk space
+- Missing build tools (for native modules)
+
+#### Packages installed but nodes not available
+
+Ensure `autoInstallModules: true` in Node-RED settings. This tells Node-RED to load packages from `node_modules` directory.
 
 ## Use Cases
 

@@ -2,6 +2,7 @@ import { Redis, type RedisOptions } from 'ioredis';
 import { promisify } from 'util';
 import { gzip, gunzip } from 'zlib';
 import { FileSystemHelper } from './filesystem-helper.js';
+import { PackageHelper } from './package-helper.js';
 import type {
   ValkeyStorageConfig,
   NodeREDSettings,
@@ -24,6 +25,9 @@ export class ValkeyStorage implements StorageModule {
   private subscriber?: Redis;
   private config!: Required<ValkeyStorageConfig>;
   private fsHelper?: FileSystemHelper;
+  private packageHelper?: PackageHelper;
+  private packageSubscriber?: Redis;
+  private lastKnownPackages?: Set<string>;
 
   constructor() {
     // Properties initialized in init()
@@ -44,6 +48,10 @@ export class ValkeyStorage implements StorageModule {
       enableCompression = false,
       sessionTTL = 86400, // 24 hours
       supportFileSystemProjects = false,
+      syncPackages = false,
+      packageChannel = 'nodered:packages:updated',
+      packageSyncOnAdmin = false,
+      packageSyncOnWorker = false,
       ...ioredisConfig
     } = userConfig;
 
@@ -59,6 +67,10 @@ export class ValkeyStorage implements StorageModule {
       enableCompression,
       sessionTTL,
       supportFileSystemProjects,
+      syncPackages,
+      packageChannel,
+      packageSyncOnAdmin,
+      packageSyncOnWorker,
       // Preserve ioredis config for logging and duplicate()
       ...ioredisOptions,
     } as Required<ValkeyStorageConfig>;
@@ -116,6 +128,71 @@ export class ValkeyStorage implements StorageModule {
       }
       this.fsHelper = new FileSystemHelper(settings.userDir);
       console.log(`[ValkeyStorage] File system projects support enabled, using ${settings.userDir}`);
+    }
+
+    // Initialize package synchronization
+    if (this.config.syncPackages) {
+      if (!settings.userDir) {
+        throw new Error('[ValkeyStorage] syncPackages requires settings.userDir to be set');
+      }
+
+      // Initialize PackageHelper
+      this.packageHelper = new PackageHelper(settings.userDir);
+      console.log(`[ValkeyStorage] Package synchronization enabled, using ${settings.userDir}`);
+
+      // Setup package subscriber for worker nodes
+      if (this.config.packageSyncOnWorker) {
+        this.packageSubscriber = this.client.duplicate();
+        await this.packageSubscriber.subscribe(this.config.packageChannel);
+
+        this.packageSubscriber.on('message', async (channel: string, message: string) => {
+          if (channel === this.config.packageChannel) {
+            try {
+              console.log(`[ValkeyStorage] Package update notification received`);
+
+              // Parse package list from message
+              const packageList: string[] = JSON.parse(message);
+
+              if (packageList.length > 0) {
+                // Install packages (will throw on error, causing process to exit)
+                await this.packageHelper!.installPackages(packageList);
+
+                console.log('[ValkeyStorage] Packages installed successfully, restarting...');
+                // Exit process, Docker/Swarm will restart automatically
+                process.exit(0);
+              } else {
+                console.log('[ValkeyStorage] No packages to install, skipping restart');
+              }
+            } catch (error) {
+              console.error('[ValkeyStorage] Error processing package update:', error);
+              // Fail fast - exit with error code
+              process.exit(1);
+            }
+          }
+        });
+
+        console.log(`[ValkeyStorage] Subscribed to package updates on ${this.config.packageChannel}`);
+      }
+
+      // Load initial package state from Redis for admin nodes
+      if (this.config.packageSyncOnAdmin) {
+        const configKey = this.getKey('config');
+        const configData = await this.client.get(configKey);
+
+        if (configData) {
+          try {
+            const configJson = await this.deserialize<any>(configData);
+            this.lastKnownPackages = this.extractPackages(configJson);
+            console.log(`[ValkeyStorage] Loaded ${this.lastKnownPackages.size} existing packages from Redis`);
+          } catch (error) {
+            console.error('[ValkeyStorage] Error loading initial package state:', error);
+            // Non-fatal - just start with empty state
+            this.lastKnownPackages = new Set();
+          }
+        } else {
+          this.lastKnownPackages = new Set();
+        }
+      }
     }
   }
 
@@ -222,6 +299,11 @@ export class ValkeyStorage implements StorageModule {
     const data = await this.serialize(settings);
 
     await this.client.set(key, data);
+
+    // Package sync: intercept .config.json changes
+    if (this.config.syncPackages && this.config.packageSyncOnAdmin) {
+      await this.handlePackageSync(settings);
+    }
   }
 
   /**
@@ -340,9 +422,94 @@ export class ValkeyStorage implements StorageModule {
    * Close connections (for cleanup)
    */
   async close(): Promise<void> {
+    if (this.packageSubscriber) {
+      await this.packageSubscriber.quit();
+    }
     if (this.subscriber) {
       await this.subscriber.quit();
     }
     await this.client.quit();
+  }
+
+  /**
+   * Handle package synchronization from .config.json changes
+   */
+  private async handlePackageSync(settings: UserSettings): Promise<void> {
+    try {
+      // Extract Node-RED .config.json from settings
+      const configJson = settings['.config.json'];
+      if (!configJson) {
+        return; // No .config.json in settings, nothing to sync
+      }
+
+      // Save .config.json to Redis
+      const configKey = this.getKey('config');
+      const configData = await this.serialize(configJson);
+      await this.client.set(configKey, configData);
+
+      // Extract installed packages (nodes property contains installed modules)
+      const installedPackages = this.extractPackages(configJson);
+
+      // Detect changes
+      if (this.hasPackageChanges(installedPackages)) {
+        console.log('[ValkeyStorage] Package changes detected, publishing update...');
+
+        // Publish package list as JSON array
+        const packageList = Array.from(installedPackages);
+        await this.client.publish(this.config.packageChannel, JSON.stringify(packageList));
+
+        console.log(`[ValkeyStorage] Published ${packageList.length} package(s) to ${this.config.packageChannel}`);
+
+        // Update known packages
+        this.lastKnownPackages = installedPackages;
+      }
+    } catch (error) {
+      console.error('[ValkeyStorage] Error handling package sync:', error);
+      // Non-fatal - log and continue
+    }
+  }
+
+  /**
+   * Extract package names from Node-RED .config.json
+   * Filters out core Node-RED modules
+   */
+  private extractPackages(configJson: any): Set<string> {
+    const packages = new Set<string>();
+
+    if (configJson.nodes) {
+      for (const packageName of Object.keys(configJson.nodes)) {
+        // Filter out core nodes (start with 'node-red/')
+        // Keep all user-installed packages
+        if (!packageName.startsWith('node-red/')) {
+          packages.add(packageName);
+        }
+      }
+    }
+
+    return packages;
+  }
+
+  /**
+   * Check if package list has changed from last known state
+   */
+  private hasPackageChanges(newPackages: Set<string>): boolean {
+    // First run - always consider as changed
+    if (!this.lastKnownPackages) {
+      return true;
+    }
+
+    // Different size means changes occurred
+    if (newPackages.size !== this.lastKnownPackages.size) {
+      return true;
+    }
+
+    // Check if all packages match
+    for (const pkg of newPackages) {
+      if (!this.lastKnownPackages.has(pkg)) {
+        return true;
+      }
+    }
+
+    return false;
   }
 }
