@@ -2,6 +2,8 @@
 
 A professional Valkey/Redis storage module for Node-RED with built-in pub/sub support for automatic worker reload in clustered environments.
 
+> 💡 **Tip**: For complete Node-RED clustering, pair this with [node-red-context-valkey](https://github.com/Siphion/node-red-context-valkey) to share context data across instances. Both modules use the same `valkey` configuration object.
+
 ## Features
 
 - ✅ **Full Storage API Implementation** - All 11 Node-RED storage methods
@@ -229,6 +231,41 @@ When `supportFileSystemProjects` is enabled:
 - **File format** - Flows saved as `{rev: "...", flows: [...]}` for projects compatibility
 
 ## Use Cases
+
+### Complete Clustering Solution
+
+For full Node-RED clustering with shared state across all instances, combine with [node-red-context-valkey](https://github.com/Siphion/node-red-context-valkey):
+
+```javascript
+// settings.js - Complete clustering setup
+module.exports = {
+  // Storage module (flows, credentials, settings)
+  storageModule: require('node-red-storage-valkey'),
+
+  // Context module (shared context data)
+  contextStorage: {
+    default: {
+      module: require('node-red-context-valkey')
+    }
+  },
+
+  // Shared configuration for both modules
+  valkey: {
+    host: 'localhost',
+    port: 6379,
+    keyPrefix: 'nodered:',
+    publishOnSave: true,
+    subscribeToUpdates: true,
+    enableCompression: true
+  }
+};
+```
+
+This gives you:
+- ✅ Shared flows and credentials (this module)
+- ✅ Shared context data (node-red-context-valkey)
+- ✅ Auto-reload on flow updates
+- ✅ True horizontal scaling with shared state
 
 ### Docker Swarm Cluster
 
