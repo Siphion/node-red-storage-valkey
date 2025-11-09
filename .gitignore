@@ -8,5 +8,4 @@ coverage/
 .idea/
 *.tgz
 .claude/settings.local.json
-/dist
 CLAUDE.md

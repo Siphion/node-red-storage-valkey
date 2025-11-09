@@ -1,6 +1,7 @@
 import { Redis, type RedisOptions } from 'ioredis';
 import { promisify } from 'util';
 import { gzip, gunzip } from 'zlib';
+import { FileSystemHelper } from './filesystem-helper.js';
 import type {
   ValkeyStorageConfig,
   NodeREDSettings,
@@ -22,6 +23,7 @@ export class ValkeyStorage implements StorageModule {
   private client!: Redis;
   private subscriber?: Redis;
   private config!: Required<ValkeyStorageConfig>;
+  private fsHelper?: FileSystemHelper;
 
   constructor() {
     // Properties initialized in init()
@@ -41,6 +43,7 @@ export class ValkeyStorage implements StorageModule {
       updateChannel = 'nodered:flows:updated',
       enableCompression = false,
       sessionTTL = 86400, // 24 hours
+      supportFileSystemProjects = false,
       ...ioredisConfig
     } = userConfig;
 
@@ -55,6 +58,7 @@ export class ValkeyStorage implements StorageModule {
       updateChannel,
       enableCompression,
       sessionTTL,
+      supportFileSystemProjects,
       // Preserve ioredis config for logging and duplicate()
       ...ioredisOptions,
     } as Required<ValkeyStorageConfig>;
@@ -104,6 +108,15 @@ export class ValkeyStorage implements StorageModule {
 
       console.log(`[ValkeyStorage] Subscribed to ${this.config.updateChannel}`);
     }
+
+    // Initialize file system helper for projects support
+    if (this.config.supportFileSystemProjects) {
+      if (!settings.userDir) {
+        throw new Error('[ValkeyStorage] supportFileSystemProjects requires settings.userDir to be set');
+      }
+      this.fsHelper = new FileSystemHelper(settings.userDir);
+      console.log(`[ValkeyStorage] File system projects support enabled, using ${settings.userDir}`);
+    }
   }
 
   /**
@@ -113,11 +126,29 @@ export class ValkeyStorage implements StorageModule {
     const key = this.getKey('flows');
     const data = await this.client.get(key);
 
-    if (!data) {
-      return { flows: [] };
+    // If Redis has data, use it
+    if (data) {
+      return await this.deserialize<FlowConfig>(data);
     }
 
-    return await this.deserialize<FlowConfig>(data);
+    // Redis is empty - check file system if enabled
+    if (this.fsHelper) {
+      const flowsFromFile = await this.fsHelper.getFlowsFromFile();
+      if (flowsFromFile) {
+        console.log('[ValkeyStorage] Loaded flows from file system (Redis was empty)');
+
+        // Sync to Redis for next time
+        const dataToStore = await this.serialize(flowsFromFile);
+        await this.client.set(key, dataToStore);
+        console.log('[ValkeyStorage] Synced flows from file system to Redis');
+
+        return flowsFromFile;
+      }
+    }
+
+    // Both Redis and file system are empty - return empty flows
+    // This allows the first deploy to work on virgin installations
+    return { flows: [] };
   }
 
   /**
@@ -125,7 +156,16 @@ export class ValkeyStorage implements StorageModule {
    */
   async saveFlows(flows: FlowConfig): Promise<void> {
     const key = this.getKey('flows');
-    const data = await this.serialize(flows);
+
+    // Save to file system if enabled (must be done first to generate rev)
+    let rev: string | undefined;
+    if (this.fsHelper) {
+      rev = await this.fsHelper.saveFlowsToFile(flows);
+    }
+
+    // Prepare flow data for Redis with rev if available
+    const flowData = rev ? { ...flows, rev } : flows;
+    const data = await this.serialize(flowData);
 
     await this.client.set(key, data);
 

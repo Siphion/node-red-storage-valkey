@@ -8,6 +8,7 @@ A professional Valkey/Redis storage module for Node-RED with built-in pub/sub su
 - ✅ **Valkey/Redis Compatible** - Works with both Valkey and Redis
 - ✅ **Redis Sentinel Support** - High availability with automatic failover
 - ✅ **Pub/Sub Auto-Reload** - Workers automatically reload when flows change
+- ✅ **Projects Support** - Optional file system sync for Node-RED projects and Git integration
 - ✅ **TypeScript** - Full type safety and IntelliSense support
 - ✅ **Compression** - Optional gzip compression for large flows
 - ✅ **Production Ready** - Connection pooling, retry logic, error handling
@@ -142,6 +143,7 @@ The module supports all [ioredis connection options](https://github.com/redis/io
 | `updateChannel` | string | `'nodered:flows:updated'` | Pub/sub channel name |
 | `enableCompression` | boolean | `false` | Gzip compression for large data |
 | `sessionTTL` | number | `86400` | Session expiry (seconds) |
+| `supportFileSystemProjects` | boolean | `false` | Enable file system sync for Node-RED projects |
 
 ## Storage Keys
 
@@ -152,6 +154,79 @@ All data is stored with the configured `keyPrefix`:
 - `nodered:settings` - User settings
 - `nodered:sessions` - User sessions (with TTL)
 - `nodered:library:<type>:<path>` - Library entries
+
+## Node-RED Projects Support
+
+### Hybrid Storage Mode
+
+Enable file system sync to support Node-RED projects features (Git integration, version control) while maintaining Redis-based clustering:
+
+```javascript
+// settings.js
+module.exports = {
+  storageModule: require('node-red-storage-valkey'),
+  valkey: {
+    host: 'localhost',
+    port: 6379,
+    keyPrefix: 'nodered:',
+    publishOnSave: true,
+    supportFileSystemProjects: true  // Enable file system sync
+  },
+  // Enable projects
+  editorTheme: {
+    projects: {
+      enabled: true
+    }
+  }
+};
+```
+
+### How It Works
+
+When `supportFileSystemProjects` is enabled:
+
+1. **Redis remains primary storage** - All cluster nodes sync via Redis
+2. **Flows written to disk** - Saved to `~/.node-red/flows.json` with proper formatting
+3. **Git integration works** - Projects can track changes with Git
+4. **Revision tracking** - Flow files include `rev` property for conflict detection
+5. **Automatic backup** - Creates `.flows.json.backup` on each save
+6. **Virgin installation fix** - If Redis is empty, loads from disk automatically
+
+### Architecture (Hybrid Mode)
+
+```
+┌─────────────┐
+│   Admin     │ ──── Save Flow ────┐
+│  (Editor)   │                    │
+└─────────────┘                    ▼
+       │                      ┌──────────┐
+       │                      │  Valkey  │
+       ▼                      │  /Redis  │
+  flows.json ◄──────────────► └──────────┘
+  (Git repo)         Sync          │
+                                   │
+                          Pub/Sub  │
+                                   ▼
+                            ┌─────────────┐
+                            │  Workers    │
+                            │ Auto-Reload │
+                            └─────────────┘
+```
+
+### Benefits
+
+- ✅ **Git version control** - Full project features enabled
+- ✅ **Cluster sync** - Redis ensures all nodes stay in sync
+- ✅ **Auto-reload** - Workers still reload automatically via pub/sub
+- ✅ **Backup & recovery** - Flows persisted to disk and Redis
+- ✅ **Development workflow** - Edit flows, commit to Git, deploy
+
+### Important Notes
+
+- **Admin nodes only** - Only enable on nodes with editor access
+- **Worker nodes** - Should NOT enable `supportFileSystemProjects` (Redis-only)
+- **userDir required** - Node-RED must have a valid `userDir` configured
+- **File format** - Flows saved as `{rev: "...", flows: [...]}` for projects compatibility
 
 ## Use Cases
 

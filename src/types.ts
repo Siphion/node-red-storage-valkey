@@ -46,10 +46,19 @@ export interface ValkeyStorageConfig extends Partial<RedisOptions> {
    * @default 86400 (24 hours)
    */
   sessionTTL?: number;
+
+  /**
+   * Enable file system sync for Node-RED projects support
+   * When enabled, flows are written to disk in addition to Redis
+   * This allows Git integration and project features to work
+   * @default false
+   */
+  supportFileSystemProjects?: boolean;
 }
 
 export interface NodeREDSettings {
   valkey?: ValkeyStorageConfig;
+  userDir?: string;
   [key: string]: any;
 }
 
