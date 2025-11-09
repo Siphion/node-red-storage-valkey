@@ -295,6 +295,11 @@ export class ValkeyStorage implements StorageModule {
    * Save user settings to storage
    */
   async saveSettings(settings: UserSettings): Promise<void> {
+    // Validate input
+    if (!settings || typeof settings !== 'object') {
+      throw new Error('[ValkeyStorage] saveSettings: settings must be an object');
+    }
+
     const key = this.getKey('settings');
     const data = await this.serialize(settings);
 
@@ -433,57 +438,68 @@ export class ValkeyStorage implements StorageModule {
 
   /**
    * Handle package synchronization from .config.json changes
+   * Throws errors to ensure data integrity - Node-RED needs to know if save fails
    */
   private async handlePackageSync(settings: UserSettings): Promise<void> {
-    try {
-      // Extract Node-RED .config.json from settings
-      const configJson = settings['.config.json'];
-      if (!configJson) {
-        return; // No .config.json in settings, nothing to sync
-      }
+    // Extract Node-RED .config.json from settings
+    const configJson = settings['.config.json'];
+    if (!configJson) {
+      return; // No .config.json in settings, nothing to sync
+    }
 
-      // Save .config.json to Redis
-      const configKey = this.getKey('config');
-      const configData = await this.serialize(configJson);
-      await this.client.set(configKey, configData);
+    // Save .config.json to Redis
+    const configKey = this.getKey('config');
+    const configData = await this.serialize(configJson);
+    await this.client.set(configKey, configData);
 
-      // Extract installed packages (nodes property contains installed modules)
-      const installedPackages = this.extractPackages(configJson);
+    // Extract installed packages (nodes property contains installed modules)
+    const installedPackages = this.extractPackages(configJson);
 
-      // Detect changes
-      if (this.hasPackageChanges(installedPackages)) {
-        console.log('[ValkeyStorage] Package changes detected, publishing update...');
+    // Detect changes
+    if (this.hasPackageChanges(installedPackages)) {
+      console.log('[ValkeyStorage] Package changes detected, publishing update...');
 
-        // Publish package list as JSON array
-        const packageList = Array.from(installedPackages);
-        await this.client.publish(this.config.packageChannel, JSON.stringify(packageList));
+      // Publish package list as JSON array
+      const packageList = Array.from(installedPackages);
+      await this.client.publish(this.config.packageChannel, JSON.stringify(packageList));
 
-        console.log(`[ValkeyStorage] Published ${packageList.length} package(s) to ${this.config.packageChannel}`);
+      console.log(`[ValkeyStorage] Published ${packageList.length} package(s) to ${this.config.packageChannel}`);
 
-        // Update known packages
-        this.lastKnownPackages = installedPackages;
-      }
-    } catch (error) {
-      console.error('[ValkeyStorage] Error handling package sync:', error);
-      // Non-fatal - log and continue
+      // Update known packages
+      this.lastKnownPackages = installedPackages;
     }
   }
 
   /**
    * Extract package names from Node-RED .config.json
    * Filters out core Node-RED modules
+   * Returns empty set if data is invalid (defensive)
    */
   private extractPackages(configJson: any): Set<string> {
     const packages = new Set<string>();
 
-    if (configJson.nodes) {
+    // Defensive checks - return empty set if invalid data
+    if (!configJson || typeof configJson !== 'object') {
+      console.warn('[ValkeyStorage] extractPackages: configJson is not a valid object');
+      return packages;
+    }
+
+    if (!configJson.nodes || typeof configJson.nodes !== 'object') {
+      console.warn('[ValkeyStorage] extractPackages: configJson.nodes is missing or invalid');
+      return packages;
+    }
+
+    try {
       for (const packageName of Object.keys(configJson.nodes)) {
         // Filter out core nodes (start with 'node-red/')
         // Keep all user-installed packages
-        if (!packageName.startsWith('node-red/')) {
+        if (typeof packageName === 'string' && !packageName.startsWith('node-red/')) {
           packages.add(packageName);
         }
       }
+    } catch (error) {
+      console.error('[ValkeyStorage] extractPackages: Error iterating packages:', error);
+      // Return whatever packages we collected so far
     }
 
     return packages;
