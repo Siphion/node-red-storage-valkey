@@ -283,7 +283,7 @@ Check logs for connection status:
 
 ## License
 
-Apache 2.0
+Apache-2.0
 
 ## Author
 
@@ -297,4 +297,5 @@ Contributions welcome! Please open an issue or PR on GitHub.
 
 - GitHub Issues: https://github.com/Siphion/node-red-storage-valkey/issues
 - Node-RED Forum: https://discourse.nodered.org/
+
 
