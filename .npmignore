@@ -29,3 +29,7 @@ coverage/
 node_modules/
 *.log
 .DS_Store
+
+# Claude Code
+.claude/
+CLAUDE.md
