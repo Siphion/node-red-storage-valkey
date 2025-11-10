@@ -32,6 +32,9 @@ export class ValkeyStorage implements StorageModule {
   private packageSubscriber?: Redis;
   private lastKnownPackages?: Set<string>;
   public localfilesystem?: any; // Public for git user sync in index.ts
+  // In-memory cache for worker nodes (no file write permissions)
+  private cachedFlows: FlowConfig | null = null;
+  private cachedCredentials: CredentialsConfig | null = null;
 
   constructor() {
     // Properties initialized in init()
@@ -114,6 +117,11 @@ export class ValkeyStorage implements StorageModule {
     // Initialize localfilesystem for Projects support (Admin nodes only)
     if (this.config.enableProjects && settings.userDir && runtime) {
       try {
+        // STEP 1: Restore project config from Redis BEFORE initializing localfilesystem
+        // This ensures Node-RED can activate the correct project during init
+        await this.restoreProjectConfigFromRedis(settings);
+
+        // STEP 2: Load and initialize localfilesystem
         // Dynamically resolve the localfilesystem module path
         // require.resolve('@node-red/runtime') returns something like:
         // /usr/src/node-red/node_modules/@node-red/runtime/lib/index.js
@@ -132,13 +140,14 @@ export class ValkeyStorage implements StorageModule {
           console.log('[ValkeyStorage] WARNING: LocalFileSystem does not have projects module');
         }
 
-        // Initialize localfilesystem (this sets up projects, settings files, etc.)
+        // Initialize localfilesystem (this will now read our pre-written .config.projects.json)
         await this.localfilesystem.init(settings, runtime);
 
         console.log('[ValkeyStorage] LocalFileSystem initialized successfully for Projects support');
 
-        // Restore from Redis to Projects if Redis has active project
-        await this.restoreFromRedisToProjects(settings);
+        // STEP 3: Restore flow files from Redis AFTER localfilesystem init
+        // Now that the project is activated, write flows.json and flows_cred.json
+        await this.restoreFlowFilesFromRedis(settings);
       } catch (error) {
         console.error('[ValkeyStorage] Failed to initialize localfilesystem:', error);
         // Non-fatal - continue without Projects support
@@ -148,10 +157,14 @@ export class ValkeyStorage implements StorageModule {
       if (!this.config.enableProjects) {
         console.log('[ValkeyStorage] Projects disabled (enableProjects: false), using Redis-only mode');
 
-        // Workers: restore from Redis to simple files
+        // Workers: initialize fsHelper for file writes
         if (settings.userDir) {
-          await this.restoreFromRedisToFiles(settings);
+          this.fsHelper = new FileSystemHelper(settings.userDir);
+          console.log('[ValkeyStorage] Worker: FileSystemHelper initialized for flow file writes');
         }
+
+        // Workers: load flows from Redis and write to filesystem
+        await this.loadFlowsIntoCache();
       } else if (!settings.userDir) {
         console.log('[ValkeyStorage] Projects not available: settings.userDir is not set');
       } else if (!runtime) {
@@ -258,7 +271,8 @@ export class ValkeyStorage implements StorageModule {
 
   /**
    * Get flows from storage
-   * Flows have been restored from Redis during init(), so we just read from filesystem
+   * Admin: reads from filesystem (restored during init)
+   * Worker: reads from in-memory cache (loaded during init)
    */
   async getFlows(): Promise<FlowConfig> {
     // Admin with Projects: use localfilesystem (files restored from Redis during init)
@@ -281,11 +295,17 @@ export class ValkeyStorage implements StorageModule {
       }
     }
 
-    // Workers: read from simple files (files restored from Redis during init)
+    // Workers: return from in-memory cache (loaded during init)
+    if (this.cachedFlows !== null) {
+      console.log('[ValkeyStorage] Worker returning flows from memory cache');
+      return this.cachedFlows;
+    }
+
+    // Workers with fsHelper (legacy support)
     if (this.fsHelper) {
       const flowsFromFile = await this.fsHelper.getFlowsFromFile();
       if (flowsFromFile) {
-        console.log('[ValkeyStorage] Worker loaded flows from filesystem');
+        console.log('[ValkeyStorage] Worker loaded flows from filesystem (legacy)');
         return flowsFromFile;
       }
     }
@@ -374,7 +394,8 @@ export class ValkeyStorage implements StorageModule {
 
   /**
    * Get credentials from storage
-   * Credentials have been restored from Redis during init(), so we just read from filesystem
+   * Admin: reads from filesystem (restored during init)
+   * Worker: reads from in-memory cache (loaded during init)
    */
   async getCredentials(): Promise<CredentialsConfig> {
     // Admin with Projects: use localfilesystem (files restored from Redis during init)
@@ -389,9 +410,14 @@ export class ValkeyStorage implements StorageModule {
       }
     }
 
-    // Workers: credentials already restored to filesystem during init
-    // No need to read from Redis - just return empty (Node-RED will read from file)
-    console.log('[ValkeyStorage] Worker returning empty credentials (loaded from file by Node-RED)');
+    // Workers: return from in-memory cache (loaded during init)
+    if (this.cachedCredentials !== null) {
+      console.log('[ValkeyStorage] Worker returning credentials from memory cache');
+      return this.cachedCredentials;
+    }
+
+    // No cache available - return empty
+    console.log('[ValkeyStorage] Worker: no credentials cache available, returning empty');
     return {};
   }
 
@@ -558,12 +584,12 @@ export class ValkeyStorage implements StorageModule {
   }
 
   /**
-   * Restore flows and credentials from Redis to filesystem (Admin with Projects)
-   * Called during init() if Redis has data
+   * Restore project configuration from Redis BEFORE localfilesystem init
+   * Writes .config.projects.json so Node-RED can activate the project during init
    */
-  private async restoreFromRedisToProjects(settings: NodeREDSettings): Promise<void> {
+  private async restoreProjectConfigFromRedis(settings: NodeREDSettings): Promise<void> {
     if (!settings.userDir) {
-      console.warn('[ValkeyStorage] Cannot restore: userDir not set');
+      console.warn('[ValkeyStorage] Cannot restore project config: userDir not set');
       return;
     }
 
@@ -573,12 +599,60 @@ export class ValkeyStorage implements StorageModule {
       const projectData = await this.client.get(projectKey);
 
       if (!projectData) {
-        console.log('[ValkeyStorage] No active project in Redis, skipping restore');
+        console.log('[ValkeyStorage] No active project in Redis, skipping project config restore');
         return;
       }
 
       const projectMeta: ProjectMetadata = JSON.parse(projectData);
-      console.log(`[ValkeyStorage] Restoring project "${projectMeta.name}" from Redis`);
+      console.log(`[ValkeyStorage] Restoring project config for "${projectMeta.name}" from Redis`);
+
+      // Ensure projects directory exists
+      const projectsDir = path.join(settings.userDir, 'projects');
+      await fs.mkdir(projectsDir, { recursive: true });
+
+      // Write .config.projects.json to set active project
+      // Node-RED's storageSettings expects: .config.projects.json with nested structure
+      const projectsConfigPath = path.join(settings.userDir, '.config.projects.json');
+      const projectsConfig = {
+        projects: {
+          activeProject: projectMeta.name,
+          projects: {
+            [projectMeta.name]: {
+              // Minimal config - Projects module will fill in the rest
+            },
+          },
+        },
+      };
+      await fs.writeFile(projectsConfigPath, JSON.stringify(projectsConfig, null, 2), 'utf8');
+      console.log(`[ValkeyStorage] Set active project to "${projectMeta.name}" in .config.projects.json`);
+    } catch (error) {
+      console.error('[ValkeyStorage] Error restoring project config from Redis:', error);
+      // Non-fatal - continue without restore
+    }
+  }
+
+  /**
+   * Restore flow and credential files from Redis AFTER localfilesystem init
+   * Writes flows.json and flows_cred.json to the active project directory
+   */
+  private async restoreFlowFilesFromRedis(settings: NodeREDSettings): Promise<void> {
+    if (!settings.userDir) {
+      console.warn('[ValkeyStorage] Cannot restore flow files: userDir not set');
+      return;
+    }
+
+    try {
+      // Get active project from Redis
+      const projectKey = this.getKey('activeProject');
+      const projectData = await this.client.get(projectKey);
+
+      if (!projectData) {
+        console.log('[ValkeyStorage] No active project in Redis, skipping flow files restore');
+        return;
+      }
+
+      const projectMeta: ProjectMetadata = JSON.parse(projectData);
+      console.log(`[ValkeyStorage] Restoring flow files for project "${projectMeta.name}" from Redis`);
 
       // Get flows and credentials from Redis
       const flowsKey = this.getKey('flows');
@@ -611,35 +685,18 @@ export class ValkeyStorage implements StorageModule {
       const credsPath = path.join(projectDir, 'flows_cred.json');
       await fs.writeFile(credsPath, JSON.stringify(creds, null, 2), 'utf8');
       console.log(`[ValkeyStorage] Wrote credentials to ${credsPath}`);
-
-      // Write .projects.json to set active project
-      const projectsJsonPath = path.join(settings.userDir, 'projects', '.projects.json');
-      const projectsConfig = {
-        activeProject: projectMeta.name,
-        projects: {
-          [projectMeta.name]: {
-            // Minimal config - Projects will fill in the rest
-          },
-        },
-      };
-      await fs.writeFile(projectsJsonPath, JSON.stringify(projectsConfig, null, 2), 'utf8');
-      console.log(`[ValkeyStorage] Set active project to "${projectMeta.name}" in .projects.json`);
     } catch (error) {
-      console.error('[ValkeyStorage] Error restoring from Redis to Projects:', error);
+      console.error('[ValkeyStorage] Error restoring flow files from Redis:', error);
       // Non-fatal - continue without restore
     }
   }
 
   /**
-   * Restore flows and credentials from Redis to filesystem (Workers without Projects)
-   * Called during init() if Redis has data
+   * Load flows and credentials from Redis and save to filesystem (Workers without Projects)
+   * Called during init() - loads from Redis and calls saveFlows()/saveCredentials()
+   * This ensures Node-RED reads the correct files written by our save methods
    */
-  private async restoreFromRedisToFiles(settings: NodeREDSettings): Promise<void> {
-    if (!settings.userDir) {
-      console.warn('[ValkeyStorage] Cannot restore: userDir not set');
-      return;
-    }
-
+  private async loadFlowsIntoCache(): Promise<void> {
     try {
       // Get flows and credentials from Redis
       const flowsKey = this.getKey('flows');
@@ -650,27 +707,45 @@ export class ValkeyStorage implements StorageModule {
         this.client.get(credsKey),
       ]);
 
-      if (!flowsData) {
-        console.log('[ValkeyStorage] No flows in Redis to restore');
-        return;
+      if (flowsData) {
+        const flows = await this.deserialize<FlowConfig>(flowsData);
+        console.log('[ValkeyStorage] Worker: Loaded flows from Redis');
+
+        // Write flows directly using fsHelper (don't call saveFlows to avoid publishing)
+        if (this.fsHelper) {
+          const sanitized = this.sanitizeFlows(flows);
+          await this.fsHelper.saveFlowsToFile(sanitized);
+          console.log('[ValkeyStorage] Worker: Flows written to filesystem');
+        }
+
+        // Keep in cache for getFlows() calls
+        this.cachedFlows = flows;
+      } else {
+        console.log('[ValkeyStorage] Worker: No flows in Redis, using empty');
+        this.cachedFlows = { flows: [], rev: '0' };
       }
 
-      const flows = await this.deserialize<FlowConfig>(flowsData);
-      const creds = credsData ? await this.deserialize<CredentialsConfig>(credsData) : {};
+      if (credsData) {
+        const creds = await this.deserialize<CredentialsConfig>(credsData);
+        console.log('[ValkeyStorage] Worker: Loaded credentials from Redis');
 
-      // Write flows.json in userDir
-      const flowsPath = path.join(settings.userDir, 'flows.json');
-      const flowsToWrite = flows.flows || flows; // Handle both formats
-      await fs.writeFile(flowsPath, JSON.stringify(flowsToWrite, null, 2), 'utf8');
-      console.log(`[ValkeyStorage] Worker: Wrote flows to ${flowsPath}`);
+        // Write credentials directly to Redis (worker doesn't write creds to file)
+        const key = this.getKey('credentials');
+        const data = await this.serialize(creds);
+        await this.client.set(key, data);
 
-      // Write flows_cred.json
-      const credsPath = path.join(settings.userDir, 'flows_cred.json');
-      await fs.writeFile(credsPath, JSON.stringify(creds, null, 2), 'utf8');
-      console.log(`[ValkeyStorage] Worker: Wrote credentials to ${credsPath}`);
+        // Keep in cache
+        this.cachedCredentials = creds;
+        console.log('[ValkeyStorage] Worker: Credentials cached');
+      } else {
+        console.log('[ValkeyStorage] Worker: No credentials in Redis, using empty');
+        this.cachedCredentials = {};
+      }
     } catch (error) {
-      console.error('[ValkeyStorage] Error restoring from Redis to files:', error);
-      // Non-fatal - continue without restore
+      console.error('[ValkeyStorage] Error loading flows from Redis:', error);
+      // Initialize with empty values
+      this.cachedFlows = { flows: [], rev: '0' };
+      this.cachedCredentials = {};
     }
   }
 
