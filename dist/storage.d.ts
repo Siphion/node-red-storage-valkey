@@ -71,7 +71,7 @@ export declare class ValkeyStorage implements StorageModule {
     private restoreProjectConfigFromRedis;
     /**
      * Restore flow and credential files from Redis AFTER localfilesystem init
-     * Writes flows.json and flows_cred.json to the active project directory
+     * Uses localfilesystem.saveFlows() to update both filesystem AND memory
      */
     private restoreFlowFilesFromRedis;
     /**
