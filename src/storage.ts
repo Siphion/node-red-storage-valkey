@@ -317,8 +317,9 @@ export class ValkeyStorage implements StorageModule {
 
   /**
    * Save flows to storage and optionally publish update
+   * @param skipPublish - If true, skip publishing update event (used during init restore)
    */
-  async saveFlows(flows: FlowConfig): Promise<void> {
+  async saveFlows(flows: FlowConfig, skipPublish = false): Promise<void> {
     // Debug logging
     console.log('[ValkeyStorage] saveFlows() called with:', {
       type: typeof flows,
@@ -362,7 +363,7 @@ export class ValkeyStorage implements StorageModule {
       }
 
       // Publish update for worker nodes
-      if (this.config.publishOnSave) {
+      if (this.config.publishOnSave && !skipPublish) {
         await this.client.publish(this.config.updateChannel, Date.now().toString());
         console.log(`[ValkeyStorage] Published flow update to ${this.config.updateChannel}`);
       }
@@ -386,7 +387,7 @@ export class ValkeyStorage implements StorageModule {
     await this.client.set(key, data);
 
     // Publish update for worker nodes
-    if (this.config.publishOnSave) {
+    if (this.config.publishOnSave && !skipPublish) {
       await this.client.publish(this.config.updateChannel, Date.now().toString());
       console.log(`[ValkeyStorage] Published flow update to ${this.config.updateChannel}`);
     }
@@ -423,8 +424,9 @@ export class ValkeyStorage implements StorageModule {
 
   /**
    * Save credentials to storage
+   * @param skipPublish - If true, skip any publish events (used during init restore)
    */
-  async saveCredentials(credentials: CredentialsConfig): Promise<void> {
+  async saveCredentials(credentials: CredentialsConfig, skipPublish = false): Promise<void> {
     // Save to Projects (if available) for Git versioning
     if (this.localfilesystem) {
       await this.localfilesystem.saveCredentials(credentials);
@@ -711,12 +713,9 @@ export class ValkeyStorage implements StorageModule {
         const flows = await this.deserialize<FlowConfig>(flowsData);
         console.log('[ValkeyStorage] Worker: Loaded flows from Redis');
 
-        // Write flows directly using fsHelper (don't call saveFlows to avoid publishing)
-        if (this.fsHelper) {
-          const sanitized = this.sanitizeFlows(flows);
-          await this.fsHelper.saveFlowsToFile(sanitized);
-          console.log('[ValkeyStorage] Worker: Flows written to filesystem');
-        }
+        // Call saveFlows() with skipPublish=true to write files without triggering restart
+        await this.saveFlows(flows, true);
+        console.log('[ValkeyStorage] Worker: Flows saved to filesystem');
 
         // Keep in cache for getFlows() calls
         this.cachedFlows = flows;
@@ -729,14 +728,12 @@ export class ValkeyStorage implements StorageModule {
         const creds = await this.deserialize<CredentialsConfig>(credsData);
         console.log('[ValkeyStorage] Worker: Loaded credentials from Redis');
 
-        // Write credentials directly to Redis (worker doesn't write creds to file)
-        const key = this.getKey('credentials');
-        const data = await this.serialize(creds);
-        await this.client.set(key, data);
+        // Call saveCredentials() with skipPublish=true
+        await this.saveCredentials(creds, true);
+        console.log('[ValkeyStorage] Worker: Credentials saved');
 
         // Keep in cache
         this.cachedCredentials = creds;
-        console.log('[ValkeyStorage] Worker: Credentials cached');
       } else {
         console.log('[ValkeyStorage] Worker: No credentials in Redis, using empty');
         this.cachedCredentials = {};

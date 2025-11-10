@@ -1,6 +1,7 @@
 import { ValkeyStorage } from './storage.js';
-export { ValkeyStorage };
+import { PackageHelper } from './package-helper.js';
+export { ValkeyStorage, PackageHelper };
 export * from './types.js';
-export default function createStorage(): ValkeyStorage;
-export declare const storageModule: ValkeyStorage;
+declare const storageModule: any;
+export default storageModule;
 //# sourceMappingURL=index.d.ts.map

@@ -1,23 +1,13 @@
-export interface ValkeyStorageConfig {
-    /**
-     * Redis/Valkey host
-     * @default "localhost"
-     */
-    host?: string;
-    /**
-     * Redis/Valkey port
-     * @default 6379
-     */
-    port?: number;
-    /**
-     * Redis/Valkey password (optional)
-     */
-    password?: string;
-    /**
-     * Redis/Valkey database number
-     * @default 0
-     */
-    db?: number;
+import type { RedisOptions } from 'ioredis';
+/**
+ * Valkey Storage Configuration
+ * Extends ioredis RedisOptions to support all connection modes:
+ * - Single instance: { host, port }
+ * - Sentinel: { sentinels: [...], name: 'mymaster' }
+ * - Cluster: { cluster: [...] }
+ * - TLS: { tls: {...} }
+ */
+export interface ValkeyStorageConfig extends Partial<RedisOptions> {
     /**
      * Redis/Valkey key prefix for all storage keys
      * @default "nodered:"
@@ -50,9 +40,47 @@ export interface ValkeyStorageConfig {
      * @default 86400 (24 hours)
      */
     sessionTTL?: number;
+    /**
+     * Enable file system sync for Node-RED projects support
+     * When enabled, flows are written to disk in addition to Redis
+     * This allows Git integration and project features to work
+     * @default false
+     */
+    supportFileSystemProjects?: boolean;
+    /**
+     * Enable package synchronization from Admin to Worker nodes
+     * When enabled, .config.json changes are stored in Redis
+     * @default false
+     */
+    syncPackages?: boolean;
+    /**
+     * Pub/sub channel name for package updates
+     * @default "nodered:packages:updated"
+     */
+    packageChannel?: string;
+    /**
+     * Publish package updates to workers (Admin nodes only)
+     * Requires syncPackages to be enabled
+     * @default false
+     */
+    packageSyncOnAdmin?: boolean;
+    /**
+     * Subscribe to package updates and auto-install (Worker nodes only)
+     * Requires syncPackages to be enabled
+     * @default false
+     */
+    packageSyncOnWorker?: boolean;
+    /**
+     * Enable LocalFileSystem and Projects support (Admin nodes only)
+     * When true, initializes localfilesystem module for Projects/Git integration
+     * Workers should set this to false to use Redis-only mode
+     * @default true
+     */
+    enableProjects?: boolean;
 }
 export interface NodeREDSettings {
     valkey?: ValkeyStorageConfig;
+    userDir?: string;
     [key: string]: any;
 }
 export interface FlowConfig {
@@ -72,6 +100,19 @@ export interface SessionsConfig {
 export interface LibraryEntry {
     fn?: string;
     [key: string]: any;
+}
+/**
+ * Project metadata stored in Redis
+ */
+export interface ProjectMetadata {
+    /**
+     * Name of the active project
+     */
+    name: string;
+    /**
+     * Timestamp of last update
+     */
+    updated?: number;
 }
 /**
  * Node-RED Storage API interface
