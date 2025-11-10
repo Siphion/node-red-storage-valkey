@@ -11,7 +11,8 @@ A professional Valkey/Redis storage module for Node-RED with built-in pub/sub su
 - ✅ **Redis Sentinel Support** - High availability with automatic failover
 - ✅ **Pub/Sub Auto-Reload** - Workers automatically reload when flows change
 - ✅ **Package Synchronization** - Auto-sync Node-RED plugins from Admin to Workers
-- ✅ **Projects Support** - Optional file system sync for Node-RED projects and Git integration
+- ✅ **Projects & Git Integration** - Full support for Node-RED Projects with Git version control
+- ✅ **Hybrid Storage** - Projects use file system (Git), flows use Redis (clustering)
 - ✅ **TypeScript** - Full type safety and IntelliSense support
 - ✅ **Compression** - Optional gzip compression for large flows
 - ✅ **Production Ready** - Connection pooling, retry logic, error handling
@@ -57,6 +58,7 @@ module.exports = {
     host: process.env.REDIS_HOST || 'localhost',
     port: parseInt(process.env.REDIS_PORT) || 6379,
     keyPrefix: 'nodered:',
+    enableProjects: false, // IMPORTANT: Disable Projects on workers
     subscribeToUpdates: true, // Auto-restart on flow changes
     updateChannel: 'nodered:flows:updated',
     // Package synchronization (optional)
@@ -106,34 +108,203 @@ module.exports = {
 
 ## How It Works
 
-### Architecture
+### Architecture Overview
+
+**Redis is the Single Source of Truth** - All flows and credentials are stored in Redis. Both admin and worker nodes restore data from Redis to disk on startup, then execute from the local filesystem.
 
 ```
 ┌─────────────┐
 │   Admin     │ ──── Save Flow ────┐
 │  (Editor)   │                    │
 └─────────────┘                    ▼
-                              ┌──────────┐
-┌─────────────┐               │  Valkey  │
-│  Worker 1   │ ◄──────────── │  /Redis  │
-└─────────────┘       ▲       └──────────┘
-                      │             │
-┌─────────────┐       │             │
-│  Worker 2   │ ◄─────┴─ Pub/Sub ──┘
-└─────────────┘       Reload
-
-┌─────────────┐
-│  Worker 3   │ ◄──── Auto Reload
-└─────────────┘
+       │                      ┌──────────┐
+       │                      │  Valkey  │ ◄── Source of Truth
+       │                      │  /Redis  │
+       ▼                      └──────────┘
+ Local Disk                         │
+  (synced)                          │
+                           Pub/Sub  │
+                                    ▼
+                            ┌─────────────┐
+                            │  Workers    │
+                            │ Auto-Reload │
+                            │  + Restore  │
+                            └─────────────┘
+                                   │
+                                   ▼
+                             Local Disk
+                              (synced)
 ```
+
+### Startup Process (Restore-on-Init)
+
+Both admin and worker nodes follow this pattern on startup:
+
+**Admin Node Startup:**
+1. **Connect to Redis** → Initialize Redis client
+2. **Check for active project** → Read `nodered:activeProject` from Redis
+3. **Restore from Redis** → Write flows and credentials to project directory
+4. **Activate project** → Write `.projects.json` to set active project
+5. **Start Node-RED** → Load flows from restored filesystem
+
+**Worker Node Startup:**
+1. **Connect to Redis** → Initialize Redis client
+2. **Restore from Redis** → Write flows and credentials to `/data/flows.json`
+3. **Start Node-RED** → Load flows from restored filesystem
+4. **Subscribe to updates** → Listen for flow changes from admin
 
 ### Flow Update Process
 
-1. **Admin saves flow** → Data written to Valkey
-2. **Publish event** → `PUBLISH nodered:flows:updated <timestamp>`
-3. **Workers receive event** → Subscribe to update channel
-4. **Auto-restart** → Workers exit (Docker restarts them)
-5. **Load new flow** → Workers fetch latest from Valkey
+1. **Admin saves flow** → Data written to filesystem (Projects) AND Redis
+2. **Save active project** → Project name stored in Redis (`nodered:activeProject`)
+3. **Publish event** → `PUBLISH nodered:flows:updated <timestamp>`
+4. **Workers receive event** → Subscribe to update channel
+5. **Auto-restart** → Workers exit (Docker restarts them)
+6. **Restore on restart** → Workers read latest flows from Redis to disk
+7. **Load new flow** → Workers start with updated flows
+
+## Deployment Architecture
+
+### Recommended Pattern: Admin + Worker Nodes
+
+For production deployments, use separate admin and worker nodes with different configurations:
+
+```
+┌─────────────────────────────────────────────────────┐
+│ Admin Node (Single Instance)                        │
+│ ┌─────────────────────────────────────────────────┐ │
+│ │ - Projects enabled (Git repos on disk)          │ │
+│ │ - Editor enabled (/admin UI)                    │ │
+│ │ - Palette Manager enabled                       │ │
+│ │ - Persistent volume: /data/projects/            │ │
+│ │ - publishOnSave: true                           │ │
+│ │ - packageSyncOnAdmin: true                      │ │
+│ └─────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────┘
+                      │
+                      │ Redis Pub/Sub
+                      │ (flows + packages)
+                      ▼
+┌─────────────────────────────────────────────────────┐
+│ Worker Nodes (Horizontally Scaled)                  │
+│ ┌────────────┐  ┌────────────┐  ┌────────────┐     │
+│ │  Worker 1  │  │  Worker 2  │  │  Worker 3  │ ... │
+│ │ Projects:  │  │ Projects:  │  │ Projects:  │     │
+│ │ disabled   │  │ disabled   │  │ disabled   │     │
+│ │ Ephemeral  │  │ Ephemeral  │  │ Ephemeral  │     │
+│ │ storage    │  │ storage    │  │ storage    │     │
+│ └────────────┘  └────────────┘  └────────────┘     │
+└─────────────────────────────────────────────────────┘
+```
+
+### Why This Architecture?
+
+1. **Admin Node**:
+   - Single instance with persistent storage for Git repositories
+   - Enables Node-RED Projects for version control
+   - Provides web editor for flow development
+   - Publishes flow/package updates to workers via Redis pub/sub
+
+2. **Worker Nodes**:
+   - Horizontally scalable (add/remove as needed)
+   - Stateless - no persistent storage required
+   - Auto-reload flows from Redis when admin publishes
+   - No Projects - just execute flows
+
+3. **Benefits**:
+   - Projects data persists on admin node only
+   - Workers can scale independently
+   - Zero-downtime deployments (rolling updates)
+   - Git integration only where needed
+
+### Example Configurations
+
+#### Admin Node Settings
+
+```javascript
+// settings.js (Admin)
+module.exports = {
+  // Enable editor
+  adminAuth: {
+    type: "credentials",
+    users: [{ username: "admin", password: "$2b$...", permissions: "*" }]
+  },
+
+  // Enable Projects with Git
+  editorTheme: {
+    projects: {
+      enabled: true,
+      workflow: { mode: "manual" }
+    }
+  },
+
+  // Valkey storage with Projects support
+  storageModule: require('node-red-storage-valkey'),
+  valkey: {
+    host: process.env.REDIS_HOST || 'redis',
+    port: parseInt(process.env.REDIS_PORT) || 6379,
+    keyPrefix: 'nodered:',
+
+    // Admin publishes updates
+    publishOnSave: true,
+    updateChannel: 'nodered:flows:updated',
+
+    // Package sync: admin publishes
+    syncPackages: true,
+    packageSyncOnAdmin: true,
+    packageChannel: 'nodered:packages:updated'
+  },
+
+  // Persistent directory for Projects
+  userDir: '/data'
+};
+```
+
+#### Worker Node Settings
+
+```javascript
+// settings.js (Worker)
+module.exports = {
+  // Disable editor
+  httpAdminRoot: false,
+
+  // Projects disabled on workers
+  editorTheme: {
+    projects: { enabled: false },
+    palette: { editable: false }
+  },
+
+  // Valkey storage without Projects
+  storageModule: require('node-red-storage-valkey'),
+  valkey: {
+    host: process.env.REDIS_HOST || 'redis',
+    port: parseInt(process.env.REDIS_PORT) || 6379,
+    keyPrefix: 'nodered:',
+
+    // IMPORTANT: Disable Projects on workers
+    enableProjects: false,
+
+    // Worker subscribes and auto-restarts
+    subscribeToUpdates: true,
+    updateChannel: 'nodered:flows:updated',
+
+    // Package sync: worker installs
+    syncPackages: true,
+    packageSyncOnWorker: true,
+    packageChannel: 'nodered:packages:updated'
+  },
+
+  // Ephemeral directory (no persistence needed)
+  userDir: '/data'
+};
+```
+
+### Docker/Kubernetes Examples
+
+See the [examples/](./examples/) directory for:
+- `docker-compose.yml` - Admin + Worker setup with Docker Compose
+- `k8s/admin-statefulset.yaml` - Admin node with persistent volume
+- `k8s/worker-deployment.yaml` - Scalable worker deployment
 
 ## Configuration Options
 
@@ -157,6 +328,7 @@ The module supports all [ioredis connection options](https://github.com/redis/io
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `keyPrefix` | string | `'nodered:'` | Prefix for all Redis keys |
+| `enableProjects` | boolean | `true` | Enable Projects/Git support (admin: true, workers: false) |
 | `publishOnSave` | boolean | `false` | Publish updates (admin nodes) |
 | `subscribeToUpdates` | boolean | `false` | Subscribe to updates (worker nodes) |
 | `updateChannel` | string | `'nodered:flows:updated'` | Pub/sub channel name |
@@ -172,31 +344,33 @@ The module supports all [ioredis connection options](https://github.com/redis/io
 
 All data is stored with the configured `keyPrefix`:
 
-- `nodered:flows` - Flow configuration
-- `nodered:credentials` - Encrypted credentials
+- `nodered:flows` - Flow configuration (source of truth)
+- `nodered:credentials` - Encrypted credentials (source of truth)
+- `nodered:activeProject` - Active project metadata (name + timestamp)
 - `nodered:settings` - User settings
 - `nodered:sessions` - User sessions (with TTL)
 - `nodered:library:<type>:<path>` - Library entries
 - `nodered:config` - Node-RED package configuration (when `syncPackages` enabled)
 
+**Important:** The `flows` and `credentials` keys in Redis are the **single source of truth**. Both admin and worker nodes restore from Redis to disk on startup.
+
 ## Node-RED Projects Support
 
-### Hybrid Storage Mode
+### Git Integration Built-in
 
-Enable file system sync to support Node-RED projects features (Git integration, version control) while maintaining Redis-based clustering:
+The storage module **includes full Node-RED Projects support** with Git integration. Projects use the local file system for Git operations while flows are stored in Redis for clustering.
 
 ```javascript
-// settings.js
+// settings.js - Admin Node
 module.exports = {
   storageModule: require('node-red-storage-valkey'),
   valkey: {
     host: 'localhost',
     port: 6379,
     keyPrefix: 'nodered:',
-    publishOnSave: true,
-    supportFileSystemProjects: true  // Enable file system sync
+    publishOnSave: true
   },
-  // Enable projects
+  // Enable projects in the editor
   editorTheme: {
     projects: {
       enabled: true
@@ -207,50 +381,79 @@ module.exports = {
 
 ### How It Works
 
-When `supportFileSystemProjects` is enabled:
+The module integrates Node-RED's built-in Projects module with Redis-as-source-of-truth architecture:
 
-1. **Redis remains primary storage** - All cluster nodes sync via Redis
-2. **Flows written to disk** - Saved to `~/.node-red/flows.json` with proper formatting
-3. **Git integration works** - Projects can track changes with Git
-4. **Revision tracking** - Flow files include `rev` property for conflict detection
-5. **Automatic backup** - Creates `.flows.json.backup` on each save
-6. **Virgin installation fix** - If Redis is empty, loads from disk automatically
+1. **Redis is source of truth** - All flows stored in Redis (`nodered:flows`)
+2. **Active project tracking** - Project name stored in Redis (`nodered:activeProject`)
+3. **Restore on startup** - Admin restores project files from Redis to disk
+4. **Projects use file system** - Git repositories in `userDir/projects/<name>/`
+5. **Save to both** - Admin saves to filesystem (Git) AND Redis (workers)
+6. **Full Git integration** - Commit, push, pull, branch, merge via Node-RED UI
+7. **Version control** - Track flow changes with Git history
+8. **SSH keys** - Manage SSH keys for remote Git repositories
+9. **Hybrid architecture** - Development (Git) + Production (Redis)
+
+### Optional: File System Sync
+
+Enable `supportFileSystemProjects` to also write flows to disk (in addition to Redis):
+
+```javascript
+valkey: {
+  // ... other options
+  supportFileSystemProjects: true  // Optional: also write flows to disk
+}
+```
+
+When enabled:
+- **Flows written to disk** - Saved to `userDir/flows.json` with proper formatting
+- **Revision tracking** - Flow files include `rev` property for conflict detection
+- **Automatic backup** - Creates `.flows.json.backup` on each save
+- **Virgin installation fix** - If Redis is empty, loads from disk automatically
 
 ### Architecture (Hybrid Mode)
 
 ```
 ┌─────────────┐
-│   Admin     │ ──── Save Flow ────┐
-│  (Editor)   │                    │
-└─────────────┘                    ▼
-       │                      ┌──────────┐
-       │                      │  Valkey  │
-       ▼                      │  /Redis  │
-  flows.json ◄──────────────► └──────────┘
-  (Git repo)         Sync          │
-                                   │
-                          Pub/Sub  │
-                                   ▼
-                            ┌─────────────┐
-                            │  Workers    │
-                            │ Auto-Reload │
-                            └─────────────┘
+│   Admin     │ ──── Save Flow ────────────┐
+│  (Editor)   │                            │
+└─────────────┘                            ▼
+       │                              ┌──────────┐
+       │                              │  Valkey  │ ◄── Source of Truth
+       ▼                              │  /Redis  │     + activeProject
+  projects/                           └──────────┘
+  myproject/                               │
+   flows.json ◄────── Restore on Init ─────┤
+   (Git repo)                               │
+                                   Pub/Sub  │
+                                            ▼
+                                    ┌─────────────┐
+                                    │  Workers    │
+                                    │ Auto-Reload │
+                                    │  + Restore  │
+                                    └─────────────┘
+                                           │
+                                           ▼
+                                      flows.json
+                                   (simple, no Git)
 ```
 
 ### Benefits
 
-- ✅ **Git version control** - Full project features enabled
+- ✅ **Git version control** - Full project features enabled on admin
+- ✅ **Redis source of truth** - All nodes restore from Redis on startup
 - ✅ **Cluster sync** - Redis ensures all nodes stay in sync
-- ✅ **Auto-reload** - Workers still reload automatically via pub/sub
+- ✅ **Auto-reload** - Workers reload automatically via pub/sub
+- ✅ **Project tracking** - Active project name saved to Redis
 - ✅ **Backup & recovery** - Flows persisted to disk and Redis
 - ✅ **Development workflow** - Edit flows, commit to Git, deploy
 
 ### Important Notes
 
-- **Admin nodes only** - Only enable on nodes with editor access
-- **Worker nodes** - Should NOT enable `supportFileSystemProjects` (Redis-only)
+- **Admin nodes only** - Set `enableProjects: true` (default) on admin nodes
+- **Worker nodes** - Must set `enableProjects: false` to disable Projects
 - **userDir required** - Node-RED must have a valid `userDir` configured
-- **File format** - Flows saved as `{rev: "...", flows: [...]}` for projects compatibility
+- **Restore on init** - Both admin and workers restore from Redis at startup
+- **File format** - Admin uses project structure, workers use simple `flows.json`
 
 ## Package Synchronization
 

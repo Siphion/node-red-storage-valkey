@@ -9,3 +9,4 @@ coverage/
 *.tgz
 .claude/settings.local.json
 CLAUDE.md
+node-red/

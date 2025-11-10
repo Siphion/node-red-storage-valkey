@@ -81,6 +81,14 @@ export interface ValkeyStorageConfig extends Partial<RedisOptions> {
    * @default false
    */
   packageSyncOnWorker?: boolean;
+
+  /**
+   * Enable LocalFileSystem and Projects support (Admin nodes only)
+   * When true, initializes localfilesystem module for Projects/Git integration
+   * Workers should set this to false to use Redis-only mode
+   * @default true
+   */
+  enableProjects?: boolean;
 }
 
 export interface NodeREDSettings {
@@ -110,6 +118,20 @@ export interface SessionsConfig {
 export interface LibraryEntry {
   fn?: string;
   [key: string]: any;
+}
+
+/**
+ * Project metadata stored in Redis
+ */
+export interface ProjectMetadata {
+  /**
+   * Name of the active project
+   */
+  name: string;
+  /**
+   * Timestamp of last update
+   */
+  updated?: number;
 }
 
 /**
