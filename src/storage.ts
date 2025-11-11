@@ -3,7 +3,6 @@ import { promisify } from 'util';
 import { gzip, gunzip } from 'zlib';
 import * as fs from 'fs/promises';
 import * as path from 'path';
-import { FileSystemHelper } from './filesystem-helper.js';
 import { PackageHelper } from './package-helper.js';
 import type {
   ValkeyStorageConfig,
@@ -24,17 +23,23 @@ const gunzipAsync = promisify(gunzip);
  * Valkey/Redis storage module for Node-RED with pub/sub support
  */
 export class ValkeyStorage implements StorageModule {
-  private client!: Redis;
+  public client!: Redis;
   private subscriber?: Redis;
   private config!: Required<ValkeyStorageConfig>;
-  private fsHelper?: FileSystemHelper;
   private packageHelper?: PackageHelper;
   private packageSubscriber?: Redis;
   private lastKnownPackages?: Set<string>;
   public localfilesystem?: any; // Public for git user sync in index.ts
-  // In-memory cache for worker nodes (no file write permissions)
-  private cachedFlows: FlowConfig | null = null;
-  private cachedCredentials: CredentialsConfig | null = null;
+  private runtime?: any; // Runtime reference for worker reload
+  private packageSyncTimer?: NodeJS.Timeout; // Debounce timer for package sync
+
+  // Lazy restore flags - restore from Redis on first access (worker only)
+  private needsRestore = {
+    flows: true,
+    credentials: true,
+    settings: true,
+    sessions: true,
+  };
 
   constructor() {
     // Properties initialized in init()
@@ -44,45 +49,47 @@ export class ValkeyStorage implements StorageModule {
    * Initialize storage connection
    */
   async init(settings: NodeREDSettings, runtime?: any): Promise<void> {
-    const userConfig = settings.valkey || {};
+    // Save runtime reference for worker reload
+    this.runtime = runtime;
 
-    // Separate storage-specific options from ioredis connection options
-    const {
-      keyPrefix = 'nodered:',
-      publishOnSave = false,
-      subscribeToUpdates = false,
-      updateChannel = 'nodered:flows:updated',
-      enableCompression = false,
-      sessionTTL = 86400, // 24 hours
-      supportFileSystemProjects = false,
-      syncPackages = false,
-      packageChannel = 'nodered:packages:updated',
-      packageSyncOnAdmin = false,
-      packageSyncOnWorker = false,
-      enableProjects = true, // Default true for backward compatibility
-      ...ioredisConfig
-    } = userConfig;
+    const userConfig = (settings.valkey || {}) as Partial<ValkeyStorageConfig>;
 
-    // Type-safe ioredis config
-    const ioredisOptions = ioredisConfig as RedisOptions;
+    // Validate required role field
+    if (!userConfig.role || (userConfig.role !== 'admin' && userConfig.role !== 'worker')) {
+      throw new Error('[ValkeyStorage] "role" field is required and must be either "admin" or "worker"');
+    }
 
-    // Store storage-specific config
+    // Extract storage-specific options with defaults
+    const role = userConfig.role;
+    const keyPrefix = userConfig.keyPrefix || 'nodered:';
+    const updateChannel = userConfig.updateChannel || 'nodered:flows:updated';
+    const enableCompression = userConfig.enableCompression || false;
+    const sessionTTL = userConfig.sessionTTL || 86400;
+    const syncPackages = userConfig.syncPackages !== false; // Default to true, can be disabled with syncPackages: false
+    const packageChannel = userConfig.packageChannel || 'nodered:packages:updated';
+
+    // Extract ioredis connection options (everything else)
+    const userConfigAny = userConfig as any;
+    const ioredisOptions: RedisOptions = {
+      host: userConfigAny.host,
+      port: userConfigAny.port,
+      sentinels: userConfigAny.sentinels,
+      name: userConfigAny.name,
+      tls: userConfigAny.tls,
+      // Add any other RedisOptions properties as needed
+    };
+
+    // Store complete config
     this.config = {
+      role,
       keyPrefix,
-      publishOnSave,
-      subscribeToUpdates,
       updateChannel,
       enableCompression,
       sessionTTL,
-      supportFileSystemProjects,
       syncPackages,
       packageChannel,
-      packageSyncOnAdmin,
-      packageSyncOnWorker,
-      enableProjects,
-      // Preserve ioredis config for logging and duplicate()
       ...ioredisOptions,
-    } as Required<ValkeyStorageConfig>;
+    } as any; // Type assertion needed due to optional RedisOptions properties
 
     // Pass ioredis options directly - let ioredis handle its own defaults
     const connectionConfig: RedisOptions = ioredisOptions;
@@ -115,48 +122,21 @@ export class ValkeyStorage implements StorageModule {
     console.log(`[ValkeyStorage] Connected to ${connInfo}`);
 
     // Initialize localfilesystem for both Admin and Worker nodes
+    // Restore from Redis will happen lazily on first get() call
     if (settings.userDir && runtime) {
       try {
-        // STEP 1: For Admin nodes with Projects, restore project config BEFORE init
-        // This ensures Node-RED can activate the correct project during localfilesystem.init()
-        if (this.config.enableProjects) {
-          await this.restoreProjectConfigFromRedis(settings);
-        }
-
-        // STEP 2: Load and initialize localfilesystem (both Admin and Worker)
         // Dynamically resolve the localfilesystem module path
         const runtimePath = require.resolve('@node-red/runtime');
-        const runtimeLibDir = path.dirname(runtimePath);
-        const localfsPath = path.join(runtimeLibDir, 'storage/localfilesystem');
+        const runtimeLibDir = require('path').dirname(runtimePath);
+        const localfsPath = require('path').join(runtimeLibDir, 'storage/localfilesystem');
 
-        console.log('[ValkeyStorage] Attempting to load localfilesystem from:', localfsPath);
+        console.log('[ValkeyStorage] Loading localfilesystem from:', localfsPath);
         this.localfilesystem = require(localfsPath);
 
-        // Check if projects module exists
-        if (this.localfilesystem.projects) {
-          console.log('[ValkeyStorage] LocalFileSystem has projects module');
-        } else {
-          console.log('[ValkeyStorage] WARNING: LocalFileSystem does not have projects module');
-        }
-
-        // Initialize localfilesystem
+        // Initialize localfilesystem - it will load existing files or start empty
         await this.localfilesystem.init(settings, runtime);
 
-        if (this.config.enableProjects) {
-          console.log('[ValkeyStorage] LocalFileSystem initialized for Admin with Projects support');
-        } else {
-          console.log('[ValkeyStorage] LocalFileSystem initialized for Worker (no Projects)');
-        }
-
-        // STEP 3: Restore flows and credentials from Redis
-        // Admin: Restore to project directory and update localfilesystem memory
-        // Worker: Restore to normal directory and update localfilesystem memory
-        await this.restoreFlowFilesFromRedis(settings);
-
-        // STEP 4: For Worker nodes, also populate cache for getFlows/getCredentials
-        if (!this.config.enableProjects) {
-          await this.loadFlowsIntoCache();
-        }
+        console.log('[ValkeyStorage] LocalFileSystem initialized successfully');
       } catch (error) {
         console.error('[ValkeyStorage] Failed to initialize localfilesystem:', error);
         // Non-fatal - continue without localfilesystem support
@@ -170,35 +150,73 @@ export class ValkeyStorage implements StorageModule {
       }
     }
 
-    // Ensure required configuration files exist (if localfilesystem didn't create them)
-    if (settings.userDir && !this.localfilesystem) {
-      await this.ensurePackageJson(settings.userDir);
-      await this.ensureConfigFiles(settings.userDir);
+    // localfilesystem.init() handles creation of required files when enabled
+
+    // Admin: Sync existing flows and credentials to Redis on startup (if not already there)
+    if (this.config.role === 'admin' && this.localfilesystem) {
+      try {
+        // Check if flows exist in Redis
+        const flowsKey = this.getKey('flows');
+        const flowsExist = await this.client.exists(flowsKey);
+
+        if (!flowsExist) {
+          // Read flows from disk and sync to Redis
+          const flows = await this.localfilesystem.getFlows();
+          if (flows && (Array.isArray(flows) ? flows.length > 0 : Object.keys(flows).length > 0)) {
+            const data = await this.serialize(flows);
+            await this.client.set(flowsKey, data);
+            console.log('[ValkeyStorage] Admin: synced existing flows to Redis on startup');
+          }
+        }
+
+        // Check if credentials exist in Redis
+        const credsKey = this.getKey('credentials');
+        const credsExist = await this.client.exists(credsKey);
+
+        if (!credsExist) {
+          // Read credentials from disk and sync to Redis (even if empty)
+          const creds = await this.localfilesystem.getCredentials() || {};
+          const data = await this.serialize(creds);
+          await this.client.set(credsKey, data);
+          console.log('[ValkeyStorage] Admin: synced existing credentials to Redis on startup');
+        }
+      } catch (error) {
+        console.error('[ValkeyStorage] Error syncing existing data to Redis:', error);
+        // Non-fatal - continue
+      }
     }
 
-    // Setup subscriber for worker nodes
-    if (this.config.subscribeToUpdates) {
+    // Worker: Flows will be restored on first getFlows() call
+    // We can't restore during init() because runtime is not fully initialized yet
+
+    // Setup flow update subscription for worker nodes
+    if (this.config.role === 'worker') {
       this.subscriber = this.client.duplicate();
       await this.subscriber.subscribe(this.config.updateChannel);
 
-      this.subscriber.on('message', (channel: string, message: string) => {
+      this.subscriber.on('message', async (channel: string, message: string) => {
         if (channel === this.config.updateChannel) {
-          console.log(`[ValkeyStorage] Flows updated at ${message}, restarting...`);
-          // Exit process, Docker/Swarm will restart automatically
-          process.exit(0);
+          console.log(`[ValkeyStorage] Flows updated at ${message}, reloading...`);
+
+          try {
+            // Worker reads from Redis on every getFlows() call
+            // Just call loadFlows() to trigger reload without process restart
+            if (this.runtime && this.runtime.nodes && this.runtime.nodes.loadFlows) {
+              await this.runtime.nodes.loadFlows();
+              console.log('[ValkeyStorage] Worker: flows reloaded successfully');
+            } else {
+              console.log('[ValkeyStorage] Worker: runtime.nodes.loadFlows not available, restarting process');
+              process.exit(0);
+            }
+          } catch (error: any) {
+            console.error('[ValkeyStorage] Worker: error reloading flows:', error.message || error);
+            console.log('[ValkeyStorage] Falling back to process restart');
+            process.exit(0);
+          }
         }
       });
 
       console.log(`[ValkeyStorage] Subscribed to ${this.config.updateChannel}`);
-    }
-
-    // Initialize file system helper for projects support
-    if (this.config.supportFileSystemProjects) {
-      if (!settings.userDir) {
-        throw new Error('[ValkeyStorage] supportFileSystemProjects requires settings.userDir to be set');
-      }
-      this.fsHelper = new FileSystemHelper(settings.userDir);
-      console.log(`[ValkeyStorage] File system projects support enabled, using ${settings.userDir}`);
     }
 
     // Initialize package synchronization
@@ -212,7 +230,7 @@ export class ValkeyStorage implements StorageModule {
       console.log(`[ValkeyStorage] Package synchronization enabled, using ${settings.userDir}`);
 
       // Setup package subscriber for worker nodes
-      if (this.config.packageSyncOnWorker) {
+      if (this.config.role === 'worker') {
         this.packageSubscriber = this.client.duplicate();
         await this.packageSubscriber.subscribe(this.config.packageChannel);
 
@@ -221,18 +239,69 @@ export class ValkeyStorage implements StorageModule {
             try {
               console.log(`[ValkeyStorage] Package update notification received`);
 
-              // Parse package list from message
-              const packageList: string[] = JSON.parse(message);
+              // Parse package list from admin
+              const adminPackages: string[] = JSON.parse(message);
+              const adminPackageSet = new Set(adminPackages);
 
-              if (packageList.length > 0) {
-                // Install packages (will throw on error, causing process to exit)
-                await this.packageHelper!.installPackages(packageList);
+              // Read worker's current package.json to get installed packages
+              const packageJsonPath = path.join(this.packageHelper!.getUserDir(), 'package.json');
+              let workerPackages: Set<string> = new Set();
 
-                console.log('[ValkeyStorage] Packages installed successfully, restarting...');
-                // Exit process, Docker/Swarm will restart automatically
-                process.exit(0);
-              } else {
-                console.log('[ValkeyStorage] No packages to install, skipping restart');
+              try {
+                const packageContent = await fs.readFile(packageJsonPath, 'utf8');
+                const packageJson = JSON.parse(packageContent);
+                const dependencies = packageJson.dependencies || {};
+
+                for (const pkg of Object.keys(dependencies)) {
+                  // Include packages that start with 'node-red-contrib-' or '@'
+                  if (pkg.startsWith('node-red-contrib-') || pkg.startsWith('@')) {
+                    workerPackages.add(pkg);
+                  }
+                }
+
+                console.log(`[ValkeyStorage] Worker has ${workerPackages.size} packages installed`);
+                console.log(`[ValkeyStorage] Admin has ${adminPackageSet.size} packages`);
+              } catch (error) {
+                console.log('[ValkeyStorage] Worker package.json not found, assuming fresh install');
+              }
+
+              // Calculate diff
+              const packagesToInstall: string[] = [];
+              const packagesToUninstall: string[] = [];
+
+              // Find packages to install (in admin but not in worker)
+              for (const pkg of adminPackages) {
+                if (!workerPackages.has(pkg)) {
+                  packagesToInstall.push(pkg);
+                }
+              }
+
+              // Find packages to uninstall (in worker but not in admin)
+              for (const pkg of workerPackages) {
+                if (!adminPackageSet.has(pkg)) {
+                  packagesToUninstall.push(pkg);
+                }
+              }
+
+              console.log(`[ValkeyStorage] Packages to install: ${packagesToInstall.length}`);
+              console.log(`[ValkeyStorage] Packages to uninstall: ${packagesToUninstall.length}`);
+
+              // Uninstall packages first
+              if (packagesToUninstall.length > 0) {
+                console.log(`[ValkeyStorage] Uninstalling packages: ${packagesToUninstall.join(', ')}`);
+                await this.packageHelper!.uninstallPackages(packagesToUninstall);
+                console.log('[ValkeyStorage] Packages uninstalled, should be available to flows');
+              }
+
+              // Install new packages
+              if (packagesToInstall.length > 0) {
+                console.log(`[ValkeyStorage] Installing packages: ${packagesToInstall.join(', ')}`);
+                await this.packageHelper!.installPackages(packagesToInstall);
+                console.log('[ValkeyStorage] Packages installed, should be available to flows');
+              }
+
+              if (packagesToInstall.length === 0 && packagesToUninstall.length === 0) {
+                console.log('[ValkeyStorage] No package changes needed');
               }
             } catch (error) {
               console.error('[ValkeyStorage] Error processing package update:', error);
@@ -243,10 +312,87 @@ export class ValkeyStorage implements StorageModule {
         });
 
         console.log(`[ValkeyStorage] Subscribed to package updates on ${this.config.packageChannel}`);
+
+        // Sync packages on worker startup
+        try {
+          console.log('[ValkeyStorage] Worker startup: checking for package sync from Redis');
+
+          // Try to get package list from Redis
+          const packagesKey = 'nodered:packages';
+          const packagesData = await this.client.get(packagesKey);
+
+          if (packagesData) {
+            const adminPackages: string[] = JSON.parse(packagesData);
+            const adminPackageSet = new Set(adminPackages);
+            console.log(`[ValkeyStorage] Found ${adminPackages.length} packages in Redis`);
+
+            // Read worker's current package.json to get installed packages
+            const packageJsonPath = path.join(this.packageHelper!.getUserDir(), 'package.json');
+            let workerPackages: Set<string> = new Set();
+
+            try {
+              const packageContent = await fs.readFile(packageJsonPath, 'utf8');
+              const packageJson = JSON.parse(packageContent);
+              const dependencies = packageJson.dependencies || {};
+
+              for (const pkg of Object.keys(dependencies)) {
+                // Include packages that start with 'node-red-contrib-' or '@'
+                if (pkg.startsWith('node-red-contrib-') || pkg.startsWith('@')) {
+                  workerPackages.add(pkg);
+                }
+              }
+
+              console.log(`[ValkeyStorage] Worker has ${workerPackages.size} packages installed`);
+            } catch (error) {
+              console.log('[ValkeyStorage] Worker package.json not found, assuming fresh install');
+            }
+
+            // Calculate diff
+            const packagesToInstall: string[] = [];
+            const packagesToUninstall: string[] = [];
+
+            // Find packages to install (in admin but not in worker)
+            for (const pkg of adminPackages) {
+              if (!workerPackages.has(pkg)) {
+                packagesToInstall.push(pkg);
+              }
+            }
+
+            // Find packages to uninstall (in worker but not in admin)
+            for (const pkg of workerPackages) {
+              if (!adminPackageSet.has(pkg)) {
+                packagesToUninstall.push(pkg);
+              }
+            }
+
+            console.log(`[ValkeyStorage] Worker startup: ${packagesToInstall.length} to install, ${packagesToUninstall.length} to uninstall`);
+
+            // Uninstall packages first
+            if (packagesToUninstall.length > 0) {
+              console.log(`[ValkeyStorage] Worker startup: uninstalling ${packagesToUninstall.join(', ')}`);
+              await this.packageHelper!.uninstallPackages(packagesToUninstall);
+            }
+
+            // Install new packages
+            if (packagesToInstall.length > 0) {
+              console.log(`[ValkeyStorage] Worker startup: installing ${packagesToInstall.join(', ')}`);
+              await this.packageHelper!.installPackages(packagesToInstall);
+            }
+
+            if (packagesToInstall.length === 0 && packagesToUninstall.length === 0) {
+              console.log('[ValkeyStorage] Worker startup: packages already in sync');
+            }
+          } else {
+            console.log('[ValkeyStorage] No package list found in Redis yet');
+          }
+        } catch (error) {
+          console.error('[ValkeyStorage] Error syncing packages on worker startup:', error);
+          // Non-fatal error, continue with startup
+        }
       }
 
       // Load initial package state from Redis for admin nodes
-      if (this.config.packageSyncOnAdmin) {
+      if (this.config.role === 'admin') {
         const configKey = this.getKey('config');
         const configData = await this.client.get(configKey);
 
@@ -265,127 +411,190 @@ export class ValkeyStorage implements StorageModule {
         }
       }
     }
+
+    // Note: We don't restore active project during init() because Node-RED's runtime
+    // is not fully initialized yet (settings not available). The project metadata
+    // is saved to Redis when a project is created/activated, but restoration is manual.
+    // Flows are restored correctly regardless of project state.
+  }
+
+
+  /**
+   * Restore active project from Redis on admin startup (OLD METHOD - kept for reference)
+   * Uses Node-RED's Projects API to ensure proper project structure
+   */
+  private async restoreActiveProject(settings: NodeREDSettings): Promise<void> {
+    console.log('[ValkeyStorage] restoreActiveProject() called');
+    try {
+      // Check if there's an active project in Redis
+      const activeProjectKey = this.getKey('activeProject');
+      const activeProjectData = await this.client.get(activeProjectKey);
+
+      if (!activeProjectData) {
+        console.log('[ValkeyStorage] No active project in Redis, skipping restore');
+        return;
+      }
+
+      const projectMeta: ProjectMetadata = JSON.parse(activeProjectData);
+      console.log(`[ValkeyStorage] Found active project "${projectMeta.name}" in Redis`);
+
+      if (!this.localfilesystem?.projects) {
+        console.warn('[ValkeyStorage] Projects API not available, cannot restore project');
+        return;
+      }
+
+      // Check if project already exists
+      try {
+        const existingProject = await this.localfilesystem.projects.getProject(projectMeta.name);
+        if (existingProject) {
+          console.log(`[ValkeyStorage] Project "${projectMeta.name}" already exists locally`);
+          // Project exists, activate it if not already active
+          const currentActive = this.localfilesystem.projects.getActiveProject();
+          if (!currentActive || currentActive.name !== projectMeta.name) {
+            console.log(`[ValkeyStorage] Activating project "${projectMeta.name}"`);
+            const adminUser = { username: 'admin', permissions: '*' };
+            await this.localfilesystem.projects.setActiveProject(adminUser, projectMeta.name);
+            console.log(`[ValkeyStorage] Project "${projectMeta.name}" activated successfully`);
+          } else {
+            console.log(`[ValkeyStorage] Project "${projectMeta.name}" is already active`);
+          }
+          return;
+        }
+      } catch (error) {
+        // Project doesn't exist, we'll create it below
+        console.log(`[ValkeyStorage] Project "${projectMeta.name}" not found locally, will be created`);
+      }
+
+      // Get flows from Redis to initialize the project
+      const flowsKey = this.getKey('flows');
+      const flowsData = await this.client.get(flowsKey);
+
+      if (!flowsData) {
+        console.warn('[ValkeyStorage] No flows in Redis, cannot create project');
+        return;
+      }
+
+      const flowConfig: FlowConfig = await this.deserialize(flowsData);
+
+      // Create project using Node-RED's Projects API
+      // We create a minimal user object for the API call
+      const adminUser = { username: 'admin', permissions: '*' };
+
+      const projectConfig = {
+        name: projectMeta.name,
+        summary: 'Project restored from Redis',
+        // Don't set files.flow - let Node-RED use default flow.json
+        git: {
+          remotes: {}
+        }
+      };
+
+      console.log(`[ValkeyStorage] Creating project "${projectMeta.name}" using Projects API`);
+
+      try {
+        // Create the project - this will create all necessary files and git repo
+        await this.localfilesystem.projects.createProject(adminUser, projectConfig);
+        console.log(`[ValkeyStorage] Project created successfully`);
+
+        // Activate the project immediately after creation
+        await this.localfilesystem.projects.setActiveProject(adminUser, projectMeta.name);
+        console.log(`[ValkeyStorage] Project "${projectMeta.name}" activated`);
+
+        // Now write the flows to the project using saveFlows
+        // The flows will be saved to the project's flow.json via localfilesystem
+        // localfilesystem.saveFlows expects just the flows array, not the FlowConfig object
+        await this.localfilesystem.saveFlows(flowConfig.flows);
+        console.log(`[ValkeyStorage] Flows written to project`);
+
+      } catch (createError: any) {
+        console.error(`[ValkeyStorage] Error creating project: ${createError.message}`);
+        // If creation fails, log but continue - Node-RED will work without projects
+      }
+
+    } catch (error) {
+      console.error('[ValkeyStorage] Error restoring active project:', error);
+      // Non-fatal - continue without project
+    }
   }
 
   /**
    * Get flows from storage
-   * Admin: reads from filesystem (restored during init)
-   * Worker: reads from in-memory cache (loaded during init)
+   * Admin: reads from disk (persistent storage)
+   * Worker: lazy restore from Redis, then reads from local cache
    */
   async getFlows(): Promise<FlowConfig> {
-    // Admin with Projects: use localfilesystem (files restored from Redis during init)
-    if (this.localfilesystem) {
-      try {
-        const flowsFromProject = await this.localfilesystem.getFlows();
+    if (this.config.role === 'admin') {
+      // Admin: NEVER restore from Redis - disk is source of truth
+      // Just delegate directly to localfilesystem
+      if (this.localfilesystem) {
+        const result = await this.localfilesystem.getFlows();
+        console.log('[ValkeyStorage] Admin getFlows() from disk:', Array.isArray(result) ? `array[${result.length}]` : 'object');
+        return result;
+      }
+    } else {
+      // Worker: always read from Redis (no disk caching)
+      const flowsKey = this.getKey('flows');
+      const flowsData = await this.client.get(flowsKey);
 
-        // Handle null/undefined return from localfilesystem
-        if (!flowsFromProject) {
-          console.warn('[ValkeyStorage] localfilesystem.getFlows() returned null/undefined');
-          return { flows: [], rev: '0' };
+      if (flowsData) {
+        const flows = await this.deserialize<FlowConfig>(flowsData);
+
+        // Check if we have an object with flows property (non-project mode)
+        // Node-RED expects an array in non-project mode
+        if (!Array.isArray(flows) && flows && typeof flows === 'object' && 'flows' in flows) {
+          const flowsArray = (flows as any).flows;
+          console.log('[ValkeyStorage] Worker getFlows() from Redis: extracted array[' + flowsArray.length + '] from object');
+          return flowsArray;
         }
 
-        console.log('[ValkeyStorage] Admin loaded flows from filesystem');
-        // Return EXACTLY what localfilesystem returned (don't modify format)
-        return flowsFromProject;
-      } catch (error) {
-        console.error('[ValkeyStorage] Error loading flows from Projects:', error);
-        throw error;
+        // Already an array (project mode)
+        console.log('[ValkeyStorage] Worker getFlows() from Redis:',
+          Array.isArray(flows) ? `array[${flows.length}]` : `object with keys: ${Object.keys(flows).join(',')}`);
+        return flows;
       }
+
+      // No flows in Redis, return empty
+      console.log('[ValkeyStorage] Worker: no flows in Redis, returning empty array');
+      return [];
     }
 
-    // Workers: return from in-memory cache (loaded during init)
-    if (this.cachedFlows !== null) {
-      console.log('[ValkeyStorage] Worker returning flows from memory cache');
-      return this.cachedFlows;
-    }
-
-    // Workers with fsHelper (legacy support)
-    if (this.fsHelper) {
-      const flowsFromFile = await this.fsHelper.getFlowsFromFile();
-      if (flowsFromFile) {
-        console.log('[ValkeyStorage] Worker loaded flows from filesystem (legacy)');
-        return flowsFromFile;
-      }
-    }
-
-    // All sources empty - return empty flows with initial rev
-    console.log('[ValkeyStorage] No flows found, returning empty');
+    // Fallback if localfilesystem not available
+    console.warn('[ValkeyStorage] localfilesystem not available, returning empty flows');
     return { flows: [], rev: '0' };
   }
 
   /**
    * Save flows to storage and optionally publish update
-   * @param skipPublish - If true, skip publishing update event (used during init restore)
+   * Wrapper pattern: delegate to localfilesystem, then sync to Redis, then publish
+   * @param skipPublish - If true, skip publishing update event (used during lazy restore)
    */
   async saveFlows(flows: FlowConfig, skipPublish = false): Promise<void> {
-    // Debug logging
-    console.log('[ValkeyStorage] saveFlows() called with:', {
-      type: typeof flows,
-      isNull: flows === null,
-      isUndefined: flows === undefined,
-      isArray: Array.isArray(flows),
-      keys: flows ? Object.keys(flows) : 'N/A',
-      hasFlows: flows?.flows ? true : false,
-      hasRev: flows?.rev ? true : false,
-    });
-
-    // Validate and sanitize flows before saving
     const sanitized = this.sanitizeFlows(flows);
 
-    // Save to Projects (if available) for Git versioning
+    // 1. Delegate to localfilesystem (writes file + updates memory)
     if (this.localfilesystem) {
-      await this.localfilesystem.saveFlows(sanitized);
-      console.log('[ValkeyStorage] Flows saved to Projects');
+      // localfilesystem.saveFlows expects different formats:
+      // - Array when there's an active project
+      // - Object {flows: [], rev: '0'} when no active project
+      const activeProject = this.localfilesystem.projects?.getActiveProject?.();
+      const dataToSave = activeProject ? sanitized.flows : sanitized;
 
-      // ALSO save to Redis for worker distribution
-      const key = this.getKey('flows');
-      const data = await this.serialize(sanitized);
-      await this.client.set(key, data);
-      console.log('[ValkeyStorage] Flows synced to Redis for workers');
-
-      // Save active project name to Redis
-      try {
-        const activeProject = this.localfilesystem.projects?.getActiveProject();
-        if (activeProject && activeProject.name) {
-          const projectMeta: ProjectMetadata = {
-            name: activeProject.name,
-            updated: Date.now(),
-          };
-          const projectKey = this.getKey('activeProject');
-          await this.client.set(projectKey, JSON.stringify(projectMeta));
-          console.log(`[ValkeyStorage] Saved active project "${activeProject.name}" to Redis`);
-        }
-      } catch (error) {
-        console.warn('[ValkeyStorage] Could not save active project name:', error);
-        // Non-fatal - continue
-      }
-
-      // Publish update for worker nodes
-      if (this.config.publishOnSave && !skipPublish) {
-        await this.client.publish(this.config.updateChannel, Date.now().toString());
-        console.log(`[ValkeyStorage] Published flow update to ${this.config.updateChannel}`);
-      }
-
-      return;
+      await this.localfilesystem.saveFlows(dataToSave);
+      console.log('[ValkeyStorage] Flows saved via localfilesystem');
+    } else {
+      console.warn('[ValkeyStorage] localfilesystem not available, skipping file write');
     }
 
-    // Fallback to Redis storage
+    // 2. Sync to Redis (always to global key - active flow only)
+    // Admin: sync current active flow to Redis for workers
+    // Worker: should not normally save flows (read-only)
     const key = this.getKey('flows');
-
-    // Save to file system if enabled (must be done first to generate rev)
-    let rev: string | undefined;
-    if (this.fsHelper) {
-      rev = await this.fsHelper.saveFlowsToFile(sanitized);
-    }
-
-    // Prepare flow data for Redis with rev if available
-    const flowData = rev ? { ...sanitized, rev } : sanitized;
-    const data = await this.serialize(flowData);
-
+    const data = await this.serialize(sanitized);
     await this.client.set(key, data);
+    console.log('[ValkeyStorage] Flows synced to Redis (active flow)');
 
-    // Publish update for worker nodes
-    if (this.config.publishOnSave && !skipPublish) {
+    // 4. Publish update for worker nodes (admin only)
+    if (this.config.role === 'admin' && !skipPublish) {
       await this.client.publish(this.config.updateChannel, Date.now().toString());
       console.log(`[ValkeyStorage] Published flow update to ${this.config.updateChannel}`);
     }
@@ -393,147 +602,179 @@ export class ValkeyStorage implements StorageModule {
 
   /**
    * Get credentials from storage
-   * Admin: reads from filesystem (restored during init)
-   * Worker: reads from in-memory cache (loaded during init)
+   * Admin: reads from disk (persistent storage)
+   * Worker: lazy restore from Redis, then reads from local cache
    */
   async getCredentials(): Promise<CredentialsConfig> {
-    // Admin with Projects: use localfilesystem (files restored from Redis during init)
-    if (this.localfilesystem) {
-      try {
-        const credentialsFromProject = await this.localfilesystem.getCredentials();
-        console.log('[ValkeyStorage] Admin loaded credentials from filesystem');
-        return credentialsFromProject || {};
-      } catch (error) {
-        console.error('[ValkeyStorage] Error loading credentials from Projects:', error);
-        return {};
+    if (this.config.role === 'admin') {
+      // Admin: NEVER restore from Redis - disk is source of truth
+      if (this.localfilesystem) {
+        return (await this.localfilesystem.getCredentials()) || {};
       }
+    } else {
+      // Worker: always read from Redis (no disk caching)
+      const credsKey = this.getKey('credentials');
+      const credsData = await this.client.get(credsKey);
+
+      if (credsData) {
+        const creds = await this.deserialize<CredentialsConfig>(credsData);
+        console.log('[ValkeyStorage] Worker getCredentials() from Redis:', JSON.stringify(creds).substring(0, 100));
+        return creds;
+      }
+
+      console.log('[ValkeyStorage] Worker: no credentials in Redis, returning empty');
+      return {};
     }
 
-    // Workers: return from in-memory cache (loaded during init)
-    if (this.cachedCredentials !== null) {
-      console.log('[ValkeyStorage] Worker returning credentials from memory cache');
-      return this.cachedCredentials;
-    }
-
-    // No cache available - return empty
-    console.log('[ValkeyStorage] Worker: no credentials cache available, returning empty');
+    // Fallback if localfilesystem not available
+    console.warn('[ValkeyStorage] localfilesystem not available, returning empty credentials');
     return {};
   }
 
   /**
    * Save credentials to storage
-   * @param skipPublish - If true, skip any publish events (used during init restore)
+   * Wrapper pattern: delegate to localfilesystem, then sync to Redis
    */
-  async saveCredentials(credentials: CredentialsConfig, skipPublish = false): Promise<void> {
-    // Save to Projects (if available) for Git versioning
+  async saveCredentials(credentials: CredentialsConfig): Promise<void> {
+    // 1. Delegate to localfilesystem (writes file + updates memory)
     if (this.localfilesystem) {
       await this.localfilesystem.saveCredentials(credentials);
-      console.log('[ValkeyStorage] Credentials saved to Projects');
-
-      // ALSO save to Redis for worker distribution and container restart recovery
-      const key = this.getKey('credentials');
-      const data = await this.serialize(credentials);
-      await this.client.set(key, data);
-      console.log('[ValkeyStorage] Credentials synced to Redis for workers');
-
-      return;
+      console.log('[ValkeyStorage] Credentials saved via localfilesystem');
+    } else {
+      console.warn('[ValkeyStorage] localfilesystem not available, skipping file write');
     }
 
-    // Fallback to Redis storage
+    // 2. Sync to Redis (always to global key - active credentials only)
     const key = this.getKey('credentials');
     const data = await this.serialize(credentials);
-
     await this.client.set(key, data);
+    console.log('[ValkeyStorage] Credentials synced to Redis (active credentials)');
   }
 
   /**
    * Get user settings from storage
+   * Admin: reads from disk (persistent storage)
+   * Worker: lazy restore from Redis, then reads from local cache
    */
   async getSettings(): Promise<UserSettings> {
-    // Delegate to localfilesystem if available (required for Projects)
-    if (this.localfilesystem) {
-      return await this.localfilesystem.getSettings();
-    }
+    if (this.config.role === 'admin') {
+      // Admin: NEVER restore from Redis - disk is source of truth
+      if (this.localfilesystem) {
+        return await this.localfilesystem.getSettings();
+      }
+    } else {
+      // Worker: always read from Redis (no disk caching)
+      const settingsKey = this.getKey('settings');
+      const settingsData = await this.client.get(settingsKey);
 
-    // Fallback to Redis storage
-    const key = this.getKey('settings');
-    const data = await this.client.get(key);
+      if (settingsData) {
+        const settings = await this.deserialize<UserSettings>(settingsData);
+        console.log('[ValkeyStorage] Worker getSettings() from Redis');
+        return settings;
+      }
 
-    if (!data) {
+      console.log('[ValkeyStorage] Worker: no settings in Redis, returning empty');
       return {};
     }
 
-    return await this.deserialize<UserSettings>(data);
+    // Fallback if localfilesystem not available
+    console.warn('[ValkeyStorage] localfilesystem not available, returning empty settings');
+    return {};
   }
 
   /**
    * Save user settings to storage
+   * Wrapper pattern: delegate to localfilesystem, then sync to Redis, then package sync
    */
   async saveSettings(settings: UserSettings): Promise<void> {
-    console.log('[ValkeyStorage] saveSettings called with keys:', Object.keys(settings));
-
     // Validate input
     if (!settings || typeof settings !== 'object') {
       throw new Error('[ValkeyStorage] saveSettings: settings must be an object');
     }
 
-    // Delegate to localfilesystem if available (required for Projects)
+    // 1. Delegate to localfilesystem (writes file + updates memory)
     if (this.localfilesystem) {
       await this.localfilesystem.saveSettings(settings);
-      console.log('[ValkeyStorage] Settings saved to filesystem via localfilesystem');
-
-      // Package sync: run in background (non-blocking) to prevent "Settings unavailable" errors
-      if (this.config.syncPackages && this.config.packageSyncOnAdmin) {
-        console.log('[ValkeyStorage] Starting package sync (non-blocking)...');
-        // Fire and forget - don't block settings save
-        this.handlePackageSync(settings).catch(error => {
-          console.error('[ValkeyStorage] Package sync failed (non-blocking):', error);
-        });
-      }
-
-      return;
+      console.log('[ValkeyStorage] Settings saved via localfilesystem');
+    } else {
+      console.warn('[ValkeyStorage] localfilesystem not available, skipping file write');
     }
 
-    // Fallback to Redis storage
+    // 2. Sync to Redis
     const key = this.getKey('settings');
     const data = await this.serialize(settings);
-
-    console.log('[ValkeyStorage] Saving settings to Redis key:', key);
     await this.client.set(key, data);
-    console.log('[ValkeyStorage] Settings saved successfully');
+    console.log('[ValkeyStorage] Settings synced to Redis');
 
-    // Package sync: run in background (non-blocking) to prevent "Settings unavailable" errors
-    if (this.config.syncPackages && this.config.packageSyncOnAdmin) {
-      console.log('[ValkeyStorage] Starting package sync (non-blocking)...');
-      // Fire and forget - don't block settings save
-      this.handlePackageSync(settings).catch(error => {
-        console.error('[ValkeyStorage] Package sync failed (non-blocking):', error);
-      });
+    // 3. Package sync: debounced to wait for package.json update (admin only)
+    if (this.config.syncPackages && this.config.role === 'admin') {
+      // Clear existing timer if any
+      if (this.packageSyncTimer) {
+        clearTimeout(this.packageSyncTimer);
+      }
+
+      console.log('[ValkeyStorage] Scheduling package sync (debounced 500ms)...');
+
+      // Schedule package sync after 500ms to allow package.json to be updated
+      this.packageSyncTimer = setTimeout(() => {
+        console.log('[ValkeyStorage] Running debounced package sync...');
+        this.handlePackageSync(settings).catch(error => {
+          console.error('[ValkeyStorage] Package sync failed:', error);
+        });
+      }, 500);
+    } else {
+      console.log('[ValkeyStorage] Package sync skipped: syncPackages=' + this.config.syncPackages + ', role=' + this.config.role);
     }
   }
 
   /**
    * Get sessions from storage
+   * Admin: reads from disk (persistent storage)
+   * Worker: lazy restore from Redis, then reads from local cache
    */
   async getSessions(): Promise<SessionsConfig> {
-    const key = this.getKey('sessions');
-    const data = await this.client.get(key);
+    if (this.config.role === 'admin') {
+      // Admin: NEVER restore from Redis - disk is source of truth
+      if (this.localfilesystem) {
+        return (await this.localfilesystem.getSessions()) || {};
+      }
+    } else {
+      // Worker: always read from Redis (no disk caching)
+      const sessionsKey = this.getKey('sessions');
+      const sessionsData = await this.client.get(sessionsKey);
 
-    if (!data) {
+      if (sessionsData) {
+        const sessions = await this.deserialize<SessionsConfig>(sessionsData);
+        console.log('[ValkeyStorage] Worker getSessions() from Redis');
+        return sessions;
+      }
+
+      console.log('[ValkeyStorage] Worker: no sessions in Redis, returning empty');
       return {};
     }
 
-    return await this.deserialize<SessionsConfig>(data);
+    // Fallback if localfilesystem not available
+    console.warn('[ValkeyStorage] localfilesystem not available, returning empty sessions');
+    return {};
   }
 
   /**
    * Save sessions to storage with TTL
    */
   async saveSessions(sessions: SessionsConfig): Promise<void> {
+    // 1. Delegate to localfilesystem (writes file + updates memory)
+    if (this.localfilesystem) {
+      await this.localfilesystem.saveSessions(sessions);
+      console.log('[ValkeyStorage] Sessions saved via localfilesystem');
+    } else {
+      console.warn('[ValkeyStorage] localfilesystem not available, skipping file write');
+    }
+
+    // 2. Sync to Redis with TTL
     const key = this.getKey('sessions');
     const data = await this.serialize(sessions);
-
     await this.client.set(key, data, 'EX', this.config.sessionTTL);
+    console.log('[ValkeyStorage] Sessions synced to Redis');
   }
 
   /**
@@ -584,152 +825,87 @@ export class ValkeyStorage implements StorageModule {
   }
 
   /**
-   * Restore project configuration from Redis BEFORE localfilesystem init
-   * Writes .config.projects.json so Node-RED can activate the project during init
+   * Ensure data is restored from Redis on first access (lazy restore)
+   * Uses localfilesystem.save*() to update both filesystem and memory
    */
-  private async restoreProjectConfigFromRedis(settings: NodeREDSettings): Promise<void> {
-    if (!settings.userDir) {
-      console.warn('[ValkeyStorage] Cannot restore project config: userDir not set');
+  private async ensureRestored(type: 'flows' | 'credentials' | 'settings' | 'sessions'): Promise<void> {
+    // Skip if already restored or localfilesystem not available
+    if (!this.needsRestore[type] || !this.localfilesystem) {
       return;
     }
 
     try {
-      // Get active project from Redis
-      const projectKey = this.getKey('activeProject');
-      const projectData = await this.client.get(projectKey);
+      // Determine the correct Redis key based on active project
+      const activeProject = this.localfilesystem.projects?.getActiveProject?.();
+      let key: string;
 
-      if (!projectData) {
-        console.log('[ValkeyStorage] No active project in Redis, skipping project config restore');
-        return;
-      }
-
-      const projectMeta: ProjectMetadata = JSON.parse(projectData);
-      console.log(`[ValkeyStorage] Restoring project config for "${projectMeta.name}" from Redis`);
-
-      // Ensure projects directory exists
-      const projectsDir = path.join(settings.userDir, 'projects');
-      await fs.mkdir(projectsDir, { recursive: true });
-
-      // Write .config.projects.json to set active project
-      // Node-RED's storageSettings expects: .config.projects.json with nested structure
-      const projectsConfigPath = path.join(settings.userDir, '.config.projects.json');
-      const projectsConfig = {
-        projects: {
-          activeProject: projectMeta.name,
-          projects: {
-            [projectMeta.name]: {
-              // Minimal config - Projects module will fill in the rest
-            },
-          },
-        },
-      };
-      await fs.writeFile(projectsConfigPath, JSON.stringify(projectsConfig, null, 2), 'utf8');
-      console.log(`[ValkeyStorage] Set active project to "${projectMeta.name}" in .config.projects.json`);
-    } catch (error) {
-      console.error('[ValkeyStorage] Error restoring project config from Redis:', error);
-      // Non-fatal - continue without restore
-    }
-  }
-
-  /**
-   * Restore flow and credential files from Redis AFTER localfilesystem init
-   * Uses localfilesystem.saveFlows() to update both filesystem AND memory
-   */
-  private async restoreFlowFilesFromRedis(settings: NodeREDSettings): Promise<void> {
-    if (!this.localfilesystem) {
-      console.warn('[ValkeyStorage] Cannot restore: localfilesystem not initialized');
-      return;
-    }
-
-    try {
-      // Get flows and credentials from Redis
-      const flowsKey = this.getKey('flows');
-      const credsKey = this.getKey('credentials');
-
-      const [flowsData, credsData] = await Promise.all([
-        this.client.get(flowsKey),
-        this.client.get(credsKey),
-      ]);
-
-      if (!flowsData) {
-        console.log('[ValkeyStorage] No flows in Redis to restore');
-        return;
-      }
-
-      const flows = await this.deserialize<FlowConfig>(flowsData);
-      const creds = credsData ? await this.deserialize<CredentialsConfig>(credsData) : {};
-
-      console.log('[ValkeyStorage] Restoring flows and credentials from Redis');
-
-      // Use localfilesystem methods to write files AND update memory
-      await this.localfilesystem.saveFlows(flows);
-      console.log('[ValkeyStorage] Flows restored via localfilesystem');
-
-      await this.localfilesystem.saveCredentials(creds);
-      console.log('[ValkeyStorage] Credentials restored via localfilesystem');
-    } catch (error) {
-      console.error('[ValkeyStorage] Error restoring flow files from Redis:', error);
-      // Non-fatal - continue without restore
-    }
-  }
-
-  /**
-   * Load flows and credentials from Redis and save to filesystem (Workers without Projects)
-   * Called during init() - loads from Redis and calls saveFlows()/saveCredentials()
-   * This ensures Node-RED reads the correct files written by our save methods
-   */
-  private async loadFlowsIntoCache(): Promise<void> {
-    try {
-      // Get flows and credentials from Redis
-      const flowsKey = this.getKey('flows');
-      const credsKey = this.getKey('credentials');
-
-      const [flowsData, credsData] = await Promise.all([
-        this.client.get(flowsKey),
-        this.client.get(credsKey),
-      ]);
-
-      if (flowsData) {
-        const flows = await this.deserialize<FlowConfig>(flowsData);
-        console.log('[ValkeyStorage] Worker: Loaded flows from Redis');
-
-        // Call saveFlows() with skipPublish=true to write files without triggering restart
-        await this.saveFlows(flows, true);
-        console.log('[ValkeyStorage] Worker: Flows saved to filesystem');
-
-        // Keep in cache for getFlows() calls
-        this.cachedFlows = flows;
+      if (activeProject?.name && (type === 'flows' || type === 'credentials')) {
+        // For flows/credentials with active project, use project-specific key
+        key = this.getKey(`projects:${activeProject.name}:${type}`);
+        console.log(`[ValkeyStorage] Restoring ${type} from project "${activeProject.name}"`);
       } else {
-        console.log('[ValkeyStorage] Worker: No flows in Redis, using empty');
-        this.cachedFlows = { flows: [], rev: '0' };
+        // For settings/sessions, or flows/credentials without project, use global key
+        key = this.getKey(type);
       }
 
-      if (credsData) {
-        const creds = await this.deserialize<CredentialsConfig>(credsData);
-        console.log('[ValkeyStorage] Worker: Loaded credentials from Redis');
+      // Get data from Redis
+      const dataFromRedis = await this.client.get(key);
 
-        // Call saveCredentials() with skipPublish=true
-        await this.saveCredentials(creds, true);
-        console.log('[ValkeyStorage] Worker: Credentials saved');
+      if (dataFromRedis) {
+        const data = await this.deserialize(dataFromRedis);
 
-        // Keep in cache
-        this.cachedCredentials = creds;
-      } else {
-        console.log('[ValkeyStorage] Worker: No credentials in Redis, using empty');
-        this.cachedCredentials = {};
+        // For flows: check if there's an active project and use correct format
+        if (type === 'flows') {
+          const activeProject = this.localfilesystem.projects?.getActiveProject?.();
+          let dataToSave: any = data;
+
+          // If there's an active project, extract the array
+          if (activeProject && data && typeof data === 'object' && 'flows' in data) {
+            dataToSave = (data as any).flows;
+            console.log(`[ValkeyStorage] Restoring flows for active project: extracted array of ${Array.isArray(dataToSave) ? dataToSave.length : 'unknown'} flows`);
+          } else if (!activeProject) {
+            // No active project: ensure we have object format
+            if (Array.isArray(data)) {
+              dataToSave = { flows: data, rev: '0' };
+              console.log(`[ValkeyStorage] Restoring flows (no project): converting array to object format`);
+            } else {
+              console.log(`[ValkeyStorage] Restoring flows (no project): using object format with ${(data as any)?.flows?.length || 0} flows`);
+            }
+          }
+
+          // Try to save flows
+          try {
+            await this.localfilesystem.saveFlows(dataToSave);
+            const count = Array.isArray(dataToSave) ? dataToSave.length : (dataToSave?.flows?.length || 0);
+            console.log(`[ValkeyStorage] Restored ${count} flows from Redis via localfilesystem`);
+          } catch (saveError: any) {
+            // If save fails (e.g., due to project state), just log and continue
+            console.warn(`[ValkeyStorage] Could not save flows via localfilesystem: ${saveError.message}`);
+            console.log('[ValkeyStorage] Flows will be loaded from Redis on next getFlows() call');
+          }
+        } else {
+          // For other types (credentials, settings, sessions), restore normally
+          const saveMethod =
+            type === 'credentials' ? 'saveCredentials' :
+            type === 'settings' ? 'saveSettings' : 'saveSessions';
+
+          await this.localfilesystem[saveMethod](data);
+          console.log(`[ValkeyStorage] Restored ${type} from Redis via localfilesystem`);
+        }
       }
     } catch (error) {
-      console.error('[ValkeyStorage] Error loading flows from Redis:', error);
-      // Initialize with empty values
-      this.cachedFlows = { flows: [], rev: '0' };
-      this.cachedCredentials = {};
+      console.error(`[ValkeyStorage] Error restoring ${type} from Redis:`, error);
+      // Non-fatal - continue with whatever localfilesystem has
     }
+
+    // Mark as restored (don't try again)
+    this.needsRestore[type] = false;
   }
 
   /**
    * Get full Redis key with prefix
    */
-  private getKey(name: string): string {
+  public getKey(name: string): string {
     return `${this.config.keyPrefix}${name}`;
   }
 
@@ -834,71 +1010,6 @@ export class ValkeyStorage implements StorageModule {
   }
 
   /**
-   * Ensure package.json exists in userDir
-   * Node-RED requires this file for Palette Manager to work
-   */
-  private async ensurePackageJson(userDir: string): Promise<void> {
-    const packageJsonPath = path.join(userDir, 'package.json');
-
-    try {
-      await fs.access(packageJsonPath);
-      console.log('[ValkeyStorage] package.json found at', packageJsonPath);
-    } catch (error: any) {
-      if (error.code === 'ENOENT') {
-        // File doesn't exist - create it
-        console.log('[ValkeyStorage] Creating package.json at', packageJsonPath);
-
-        const defaultPackageJson = {
-          name: 'node-red-project',
-          description: 'A Node-RED Project',
-          version: '0.0.1',
-          private: true,
-          dependencies: {},
-        };
-
-        await fs.writeFile(packageJsonPath, JSON.stringify(defaultPackageJson, null, 4), 'utf8');
-
-        console.log('[ValkeyStorage] package.json created successfully');
-      } else {
-        // Other error - re-throw
-        console.error('[ValkeyStorage] Error checking package.json:', error);
-        throw error;
-      }
-    }
-  }
-
-  /**
-   * Ensure .config.json exists in userDir
-   * Node-RED requires this file for settings management
-   * Node-RED will automatically migrate this to separate .config.*.json files if needed
-   */
-  private async ensureConfigFiles(userDir: string): Promise<void> {
-    const configPath = path.join(userDir, '.config.json');
-
-    try {
-      await fs.access(configPath);
-      console.log('[ValkeyStorage] .config.json found at', configPath);
-    } catch (error: any) {
-      if (error.code === 'ENOENT') {
-        // File doesn't exist - create it with minimal structure
-        console.log('[ValkeyStorage] Creating .config.json at', configPath);
-
-        const defaultConfig = {
-          nodes: {},
-        };
-
-        await fs.writeFile(configPath, JSON.stringify(defaultConfig, null, 4), 'utf8');
-
-        console.log('[ValkeyStorage] .config.json created successfully');
-      } else {
-        // Other error - re-throw
-        console.error('[ValkeyStorage] Error checking .config.json:', error);
-        throw error;
-      }
-    }
-  }
-
-  /**
    * Close connections (for cleanup)
    */
   async close(): Promise<void> {
@@ -916,21 +1027,40 @@ export class ValkeyStorage implements StorageModule {
    * Throws errors to ensure data integrity - Node-RED needs to know if save fails
    */
   private async handlePackageSync(settings: UserSettings): Promise<void> {
+    console.log('[ValkeyStorage] handlePackageSync called');
+
     try {
-      // Extract Node-RED .config.json from settings
-      const configJson = settings['.config.json'];
-      if (!configJson) {
-        // No .config.json in settings - this is normal for non-palette operations
+      // Read package.json to get installed modules
+      if (!this.packageHelper) {
+        console.log('[ValkeyStorage] No packageHelper available, skipping package sync');
         return;
       }
 
-      // Save .config.json to Redis
-      const configKey = this.getKey('config');
-      const configData = await this.serialize(configJson);
-      await this.client.set(configKey, configData);
+      const packageJsonPath = path.join(this.packageHelper.getUserDir(), 'package.json');
+      console.log('[ValkeyStorage] Reading package.json from:', packageJsonPath);
 
-      // Extract installed packages (nodes property contains installed modules)
-      const installedPackages = this.extractPackages(configJson);
+      let packageJson: any;
+      try {
+        const packageContent = await fs.readFile(packageJsonPath, 'utf8');
+        packageJson = JSON.parse(packageContent);
+      } catch (error) {
+        console.log('[ValkeyStorage] No package.json found, skipping package sync');
+        return;
+      }
+
+      // Extract installed node-red packages from dependencies
+      const installedPackages = new Set<string>();
+      const dependencies = packageJson.dependencies || {};
+
+      for (const [pkg, version] of Object.entries(dependencies)) {
+        // Include packages that start with 'node-red-contrib-' or '@'
+        if (pkg.startsWith('node-red-contrib-') || pkg.startsWith('@')) {
+          installedPackages.add(pkg);
+        }
+      }
+
+      console.log('[ValkeyStorage] Found', installedPackages.size, 'installed packages in package.json');
+      console.log('[ValkeyStorage] Package list:', Array.from(installedPackages).join(', '));
 
       // Detect changes
       if (this.hasPackageChanges(installedPackages)) {
@@ -940,7 +1070,12 @@ export class ValkeyStorage implements StorageModule {
         const packageList = Array.from(installedPackages);
         await this.client.publish(this.config.packageChannel, JSON.stringify(packageList));
 
+        // Also save to Redis for worker startup sync
+        const packagesKey = 'nodered:packages';
+        await this.client.set(packagesKey, JSON.stringify(packageList));
+
         console.log(`[ValkeyStorage] Published ${packageList.length} package(s) to ${this.config.packageChannel}`);
+        console.log(`[ValkeyStorage] Saved ${packageList.length} package(s) to Redis key: ${packagesKey}`);
 
         // Update known packages
         this.lastKnownPackages = installedPackages;

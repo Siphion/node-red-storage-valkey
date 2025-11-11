@@ -2,32 +2,26 @@ import type { RedisOptions } from 'ioredis';
 
 /**
  * Valkey Storage Configuration
- * Extends ioredis RedisOptions to support all connection modes:
+ * Includes all RedisOptions to support all connection modes:
  * - Single instance: { host, port }
  * - Sentinel: { sentinels: [...], name: 'mymaster' }
  * - Cluster: { cluster: [...] }
  * - TLS: { tls: {...} }
  */
-export interface ValkeyStorageConfig extends Partial<RedisOptions> {
+export interface ValkeyStorageConfig {
+  /**
+   * Node role: 'admin' or 'worker'
+   * - admin: Uses projects, publishes flow updates, can install packages
+   * - worker: No projects (flows.json only), subscribes to flow updates, auto-restarts
+   * @required
+   */
+  role: 'admin' | 'worker';
+
   /**
    * Redis/Valkey key prefix for all storage keys
    * @default "nodered:"
    */
   keyPrefix?: string;
-
-  /**
-   * Enable pub/sub for auto-reload on flow changes
-   * Admin nodes publish, worker nodes subscribe
-   * @default false
-   */
-  publishOnSave?: boolean;
-
-  /**
-   * Subscribe to flow update events and auto-restart
-   * Only for worker nodes
-   * @default false
-   */
-  subscribeToUpdates?: boolean;
 
   /**
    * Pub/sub channel name for flow updates
@@ -48,14 +42,6 @@ export interface ValkeyStorageConfig extends Partial<RedisOptions> {
   sessionTTL?: number;
 
   /**
-   * Enable file system sync for Node-RED projects support
-   * When enabled, flows are written to disk in addition to Redis
-   * This allows Git integration and project features to work
-   * @default false
-   */
-  supportFileSystemProjects?: boolean;
-
-  /**
    * Enable package synchronization from Admin to Worker nodes
    * When enabled, .config.json changes are stored in Redis
    * @default false
@@ -67,28 +53,6 @@ export interface ValkeyStorageConfig extends Partial<RedisOptions> {
    * @default "nodered:packages:updated"
    */
   packageChannel?: string;
-
-  /**
-   * Publish package updates to workers (Admin nodes only)
-   * Requires syncPackages to be enabled
-   * @default false
-   */
-  packageSyncOnAdmin?: boolean;
-
-  /**
-   * Subscribe to package updates and auto-install (Worker nodes only)
-   * Requires syncPackages to be enabled
-   * @default false
-   */
-  packageSyncOnWorker?: boolean;
-
-  /**
-   * Enable LocalFileSystem and Projects support (Admin nodes only)
-   * When true, initializes localfilesystem module for Projects/Git integration
-   * Workers should set this to false to use Redis-only mode
-   * @default true
-   */
-  enableProjects?: boolean;
 }
 
 export interface NodeREDSettings {
