@@ -1,5 +1,9 @@
-> ⚠️ **Deprecated:** This repository is no longer maintained.  
-> The project has moved to [Siphion/node-red-cluster](https://github.com/Siphion/node-red-cluster).
+# ⚠️ **DEPRECATED REPOSITORY**
+
+This project is **no longer maintained**.  
+It has been **moved to a new repository** 👉  
+➡️ [**Siphion/node-red-cluster**](https://github.com/Siphion/node-red-cluster)
+
 
 
 # node-red-storage-valkey
@@ -581,4 +585,5 @@ Contributions welcome! Please open an issue or PR on GitHub.
 
 - GitHub Issues: https://github.com/Siphion/node-red-storage-valkey/issues
 - Node-RED Forum: https://discourse.nodered.org/
+
 
