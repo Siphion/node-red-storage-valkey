@@ -1,3 +1,7 @@
+> ⚠️ **Deprecated:** This repository is no longer maintained.  
+> The project has moved to [Siphion/node-red-cluster](https://github.com/Siphion/node-red-cluster).
+
+
 # node-red-storage-valkey
 
 A professional Valkey/Redis storage module for Node-RED with built-in pub/sub support for automatic worker reload in clustered environments.
@@ -577,3 +581,4 @@ Contributions welcome! Please open an issue or PR on GitHub.
 
 - GitHub Issues: https://github.com/Siphion/node-red-storage-valkey/issues
 - Node-RED Forum: https://discourse.nodered.org/
+
